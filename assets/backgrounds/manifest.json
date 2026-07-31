@@ -1,0 +1,42 @@
+[
+  {
+    "file": "01_aerial_grass_rock.png",
+    "resolution": "2048x2048",
+    "sha256": "dea8feda5b7ae52def43b4b3f7d99f617dfe49a58db57d0a283d9b70826763cd"
+  },
+  {
+    "file": "02_grass_path_3.png",
+    "resolution": "2048x2048",
+    "sha256": "9decb663270489c97dd4ec1b609123b8216faf3b05bb865fbf1a0f3c94931db1"
+  },
+  {
+    "file": "03_gravel_ground_01.png",
+    "resolution": "2048x2048",
+    "sha256": "f97a6e14f0f3a7a7f4b8766992af3139f76ebdb5c24b64113a31328bde0d0753"
+  },
+  {
+    "file": "04_forest_ground_01.png",
+    "resolution": "2048x2048",
+    "sha256": "cbbd3661c342883c6b539a9495c187612afe1707b18674b926b5d06fbdb3e8d8"
+  },
+  {
+    "file": "05_aerial_rocks_01.png",
+    "resolution": "2048x2048",
+    "sha256": "69d19c2254b20be728d9566242c488ba09582ff78377dd022cc4cff2d5664af6"
+  },
+  {
+    "file": "06_asphalt_023s.png",
+    "resolution": "2048x2048",
+    "sha256": "76a123b16e8aac1435d2cbc9c85c56efc156a0ed08c40f74db5bdd9bc0e7ff3f"
+  },
+  {
+    "file": "07_road_001.png",
+    "resolution": "2048x2048",
+    "sha256": "2eb024392bd528a148b012e67453d9e56b695157fb0cfd35df3f55ba52bdde13"
+  },
+  {
+    "file": "08_ground_030.png",
+    "resolution": "2048x2048",
+    "sha256": "4d5249a2b96f49dcd8f786e1a6799f4bf124bd40d34163dcf55fe7afa050ebc6"
+  }
+]
