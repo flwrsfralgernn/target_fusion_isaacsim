@@ -34,6 +34,8 @@ DEFAULT_CAMERA_PATHS = [
 DEFAULT_FUSION_OUTPUT = PROJECT_DIR / "outputs" / "target_fusion_ground_truth.jsonl"
 DEFAULT_SCHEMA_V2_OUTPUT = PROJECT_DIR / "outputs" / "target_fusion_bbox_v2.jsonl"
 DEFAULT_IMAGE_OUTPUT_DIR = PROJECT_DIR / "outputs" / "target_fusion_bbox_v2_images"
+DEFAULT_RAW_OUTPUT_DIR = PROJECT_DIR / "outputs" / "sdg_raw"
+RAW_FRAME_PADDING = 6
 GROUND_PLANE_PATH = "/World/GroundPlane"
 GROUND_MESH_PATH = "/World/GroundPlane/CollisionMesh"
 MANNEQUIN_PATH = "/World/Mannequin"
@@ -45,7 +47,7 @@ SETTLE_STABLE_SECONDS = 0.5
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Apply every PNG in a directory to /World/GroundPlane in sequence."
+        description="Generate synchronized multi-camera mannequin captures over PNG backgrounds."
     )
     parser.add_argument(
         "--world",
@@ -58,6 +60,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_BACKGROUNDS_DIR,
         help=f"Directory containing PNG backgrounds (default: {DEFAULT_BACKGROUNDS_DIR})",
+    )
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=None,
+        help=(
+            "Number of captures to generate; backgrounds repeat in stable order when this exceeds "
+            "the number of PNGs (default: one capture per background)"
+        ),
     )
     parser.add_argument(
         "--settle-timeout",
@@ -139,6 +150,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_IMAGE_OUTPUT_DIR,
         help=f"Directory for annotated camera images (default: {DEFAULT_IMAGE_OUTPUT_DIR})",
+    )
+    parser.add_argument(
+        "--raw-output-dir",
+        type=Path,
+        default=DEFAULT_RAW_OUTPUT_DIR,
+        help=(
+            "Directory for Isaac BasicWriter RGB/bbox/camera outputs (default: "
+            f"{DEFAULT_RAW_OUTPUT_DIR})"
+        ),
     )
     parser.add_argument(
         "--keep-open",
@@ -267,6 +287,154 @@ def read_rgb_annotator(annotator):
     return payload
 
 
+def set_render_product_updates(render_products, enabled: bool) -> None:
+    """Enable or disable Hydra updates for every attached render product."""
+    for render_product in render_products:
+        hydra_texture = getattr(render_product, "hydra_texture", None)
+        if hydra_texture is None:
+            raise RuntimeError("Render product has no hydra_texture interface")
+        hydra_texture.set_updates_enabled(bool(enabled))
+
+
+def basic_writer_capture_paths(
+    raw_output_dir: Path,
+    render_product_name: str,
+    frame_index: int,
+    *,
+    frame_padding: int = RAW_FRAME_PADDING,
+) -> dict[str, Path]:
+    """Return the files BasicWriter creates for one multi-render-product frame.
+
+    With ``use_common_output_dir=True``, BasicWriter prefixes each annotator
+    file with the render-product name.  Keeping this naming contract in one
+    helper lets the schema and the later YOLO exporter refer to clean RGB and
+    Isaac-native bbox files without scanning ambiguous directories.
+    """
+    raw_output_dir = Path(raw_output_dir).expanduser().resolve()
+    render_product_name = str(render_product_name)
+    if not render_product_name or Path(render_product_name).name != render_product_name:
+        raise ValueError("render_product_name must be a non-empty filename-safe name")
+    if int(frame_index) < 0:
+        raise ValueError("frame_index must be nonnegative")
+    if int(frame_padding) <= 0:
+        raise ValueError("frame_padding must be positive")
+
+    frame = f"{int(frame_index):0{int(frame_padding)}d}"
+    prefix = f"{render_product_name}_"
+    return {
+        "rgb": raw_output_dir / "rgb" / f"{prefix}rgb_{frame}.png",
+        "bbox": (
+            raw_output_dir
+            / "bounding_box_2d_tight"
+            / f"{prefix}bounding_box_2d_tight_{frame}.npy"
+        ),
+        "bbox_labels": (
+            raw_output_dir
+            / "bounding_box_2d_tight"
+            / f"{prefix}bounding_box_2d_tight_labels_{frame}.json"
+        ),
+        "bbox_prim_paths": (
+            raw_output_dir
+            / "bounding_box_2d_tight"
+            / f"{prefix}bounding_box_2d_tight_prim_paths_{frame}.json"
+        ),
+        "camera_params": (
+            raw_output_dir
+            / "camera_params"
+            / f"{prefix}camera_params_{frame}.json"
+        ),
+    }
+
+
+def initialize_basic_writer(rep, render_products, raw_output_dir: Path):
+    """Attach one Isaac BasicWriter to every render product."""
+    if not render_products:
+        raise RuntimeError("BasicWriter requires at least one render product")
+    raw_output_dir = Path(raw_output_dir).expanduser().resolve()
+    raw_output_dir.mkdir(parents=True, exist_ok=True)
+
+    backend = rep.backends.get("DiskBackend")
+    backend.initialize(output_dir=str(raw_output_dir))
+    writer = rep.writers.get("BasicWriter")
+    writer.initialize(
+        backend=backend,
+        rgb=True,
+        bounding_box_2d_tight=True,
+        camera_params=True,
+        frame_padding=RAW_FRAME_PADDING,
+        use_common_output_dir=True,
+    )
+    writer.attach(render_products)
+    return writer
+
+
+def capture_synchronized_camera_views(
+    orchestrator,
+    bbox_annotators,
+    rgb_annotators,
+    *,
+    render_products=None,
+    rt_subframes: int,
+    render_resolution,
+    target_label: str,
+    max_occlusion_ratio,
+    border_tolerance_px: float,
+):
+    """Capture and read every configured camera at one Replicator step.
+
+    Render products are attached before this function is called and remain
+    enabled for the lifetime of the writer. Replicator captures all attached
+    products during one orchestrator step, so the loops below only consume the
+    synchronized buffers and never trigger a camera-specific capture.
+    """
+    try:
+        from target_fusion import extract_target_bbox
+    except ModuleNotFoundError:
+        # The capture script is normally launched directly by Isaac Sim, while
+        # the pure-Python tests import it as ``scripts.cycle_ground_backgrounds``.
+        from scripts.target_fusion import extract_target_bbox
+
+    if len(bbox_annotators) != len(rgb_annotators):
+        raise RuntimeError(
+            "RGB and bbox annotator counts must match before synchronized capture"
+        )
+    if not bbox_annotators:
+        raise RuntimeError("Synchronized capture requires at least one camera")
+
+    render_products = [] if render_products is None else list(render_products)
+    if render_products and len(render_products) != len(bbox_annotators):
+        raise RuntimeError(
+            "Render-product and annotator counts must match before synchronized capture"
+        )
+
+    # Keep Hydra updates enabled between steps.  BasicWriter consumes the
+    # render-product data asynchronously after the step returns; disabling a
+    # product here can leave the writer with only the first frame even though
+    # the in-memory annotators appear to have captured successfully.
+    orchestrator.step(
+        delta_time=0.0,
+        rt_subframes=rt_subframes,
+        pause_timeline=True,
+        wait_for_render=True,
+    )
+
+    target_bboxes = []
+    for annotator in bbox_annotators:
+        annotation_data, annotation_info = read_bbox_annotator(annotator)
+        target_bboxes.append(
+            extract_target_bbox(
+                annotation_data,
+                annotation_info,
+                resolution=render_resolution,
+                target_label=target_label,
+                max_occlusion_ratio=max_occlusion_ratio,
+                border_tolerance_px=border_tolerance_px,
+            )
+        )
+    rgb_frames = [read_rgb_annotator(annotator) for annotator in rgb_annotators]
+    return target_bboxes, rgb_frames
+
+
 def save_annotated_capture_image(
     rgb_data,
     bbox,
@@ -358,6 +526,8 @@ def main() -> None:
         raise ValueError("--settle-timeout must be greater than zero")
     if args.scene_hold_seconds < 0:
         raise ValueError("--scene-hold-seconds must be nonnegative")
+    if args.frames is not None and args.frames <= 0:
+        raise ValueError("--frames must be greater than zero")
     if len(args.camera_prims) != 4:
         raise ValueError("--camera-prims must contain exactly four cameras")
     if len(args.resolution) != 2 or any(value <= 0 for value in args.resolution):
@@ -380,9 +550,12 @@ def main() -> None:
     simulation_app = SimulationApp({"headless": args.headless})
     schema_v2_output = None
     legacy_output = None
+    raw_manifest_output = None
+    writer = None
     render_products = []
     bbox_annotators = []
     rgb_annotators = []
+    render_product_names = []
     try:
         import isaacsim.core.experimental.utils.stage as stage_utils
         import omni.replicator.core as rep
@@ -396,14 +569,13 @@ def main() -> None:
             CameraObservation,
             FusionResult,
             aim_cameras_at_target,
-            build_camera_ray_from_observation,
+            build_rays_from_available_observations,
             build_ground_truth_record,
             build_schema_v2_record,
             clear_debug_draw,
             compute_world_target_center,
             draw_fused_rays,
             evaluate_fusion,
-            extract_target_bbox,
             fuse_rays,
             get_camera_world_pose,
         )
@@ -492,10 +664,11 @@ def main() -> None:
         rep.orchestrator.set_capture_on_play(False)
         render_resolution = tuple(args.resolution)
         for camera_index, camera_path in enumerate(args.camera_prims):
+            render_product_name = f"TargetFusion_Camera_{camera_index + 1:02d}"
             render_product = rep.create.render_product(
                 camera_path,
                 render_resolution,
-                name=f"TargetFusion_Camera_{camera_index + 1:02d}",
+                name=render_product_name,
             )
             annotator = rep.AnnotatorRegistry.get_annotator("bounding_box_2d_tight")
             annotator.attach(render_product)
@@ -504,6 +677,7 @@ def main() -> None:
             render_products.append(render_product)
             bbox_annotators.append(annotator)
             rgb_annotators.append(rgb_annotator)
+            render_product_names.append(render_product_name)
         simulation_app.update()
 
         print(f"Loaded stage: {world_path}")
@@ -520,10 +694,21 @@ def main() -> None:
         image_output_dir = args.image_output_dir.expanduser().resolve()
         if image_output_dir == world_path or image_output_dir in backgrounds:
             raise ValueError("--image-output-dir must not overwrite the USD stage or a background image")
+        raw_output_dir = args.raw_output_dir.expanduser().resolve()
+        if raw_output_dir == world_path or raw_output_dir in backgrounds:
+            raise ValueError("--raw-output-dir must not overwrite the USD stage or a background image")
+        if raw_output_dir == image_output_dir:
+            raise ValueError("--raw-output-dir and --image-output-dir must be different directories")
         image_output_dir.mkdir(parents=True, exist_ok=True)
+        raw_output_dir.mkdir(parents=True, exist_ok=True)
         schema_v2_output_path.parent.mkdir(parents=True, exist_ok=True)
         schema_v2_output = schema_v2_output_path.open("w", encoding="utf-8")
+        raw_manifest_path = raw_output_dir / "manifest.jsonl"
+        raw_manifest_output = raw_manifest_path.open("w", encoding="utf-8")
+        writer = initialize_basic_writer(rep, render_products, raw_output_dir)
         print(f"Writing schema-v2 fusion output: {schema_v2_output_path}")
+        print(f"Writing Isaac BasicWriter raw outputs: {raw_output_dir}")
+        print(f"Writing raw capture manifest: {raw_manifest_path}")
         if args.fusion_output is not None:
             legacy_output_path = output_paths[1]
             legacy_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -531,7 +716,9 @@ def main() -> None:
             print(f"Writing optional schema-v1 compatibility output: {legacy_output_path}")
         print(f"Writing annotated camera images: {image_output_dir}")
 
-        for scene_index, background_path in enumerate(backgrounds):
+        capture_count = len(backgrounds) if args.frames is None else args.frames
+        for scene_index in range(capture_count):
+            background_path = backgrounds[scene_index % len(backgrounds)]
             # Cycle boundary: remove visualization from the previous capture
             # before changing the scene for the next one.
             if not args.headless:
@@ -581,27 +768,19 @@ def main() -> None:
                         f"Fixed camera {fixed_camera_aim['camera_path']} changed orientation during the scene"
                     )
 
-            # 3-4. Fire the synchronized camera capture and leave the timeline
-            # paused while the resulting rays are inspected.
-            rep.orchestrator.step(
+            # 3-4. Fire one synchronized capture for every attached camera and
+            # leave the timeline paused while the resulting rays are inspected.
+            target_bboxes, rgb_frames = capture_synchronized_camera_views(
+                rep.orchestrator,
+                bbox_annotators,
+                rgb_annotators,
+                render_products=render_products,
                 rt_subframes=args.rt_subframes,
-                pause_timeline=True,
-                wait_for_render=True,
+                render_resolution=render_resolution,
+                target_label=args.target_label,
+                max_occlusion_ratio=args.max_occlusion_ratio,
+                border_tolerance_px=args.bbox_border_tolerance_px,
             )
-            target_bboxes = []
-            for annotator in bbox_annotators:
-                annotation_data, annotation_info = read_bbox_annotator(annotator)
-                target_bboxes.append(
-                    extract_target_bbox(
-                        annotation_data,
-                        annotation_info,
-                        resolution=render_resolution,
-                        target_label=args.target_label,
-                        max_occlusion_ratio=args.max_occlusion_ratio,
-                        border_tolerance_px=args.bbox_border_tolerance_px,
-                    )
-                )
-            rgb_frames = [read_rgb_annotator(annotator) for annotator in rgb_annotators]
             if len(rgb_frames) != len(target_bboxes):
                 raise RuntimeError(
                     "RGB annotator count does not match bbox annotator count for synchronized capture"
@@ -618,6 +797,15 @@ def main() -> None:
                     target_label=args.target_label,
                 )
                 image_paths.append(str(image_path))
+            raw_capture_paths = [
+                basic_writer_capture_paths(raw_output_dir, render_product_name, scene_index)
+                for render_product_name in render_product_names
+            ]
+            raw_image_paths = [str(paths["rgb"]) for paths in raw_capture_paths]
+            raw_bbox_paths = [str(paths["bbox"]) for paths in raw_capture_paths]
+            raw_camera_params_paths = [
+                str(paths["camera_params"]) for paths in raw_capture_paths
+            ]
             observations = [
                 CameraObservation(
                     camera_path=camera_path,
@@ -631,15 +819,10 @@ def main() -> None:
                     target_bboxes,
                 )
             ]
-            rays = []
-            for observation in observations:
-                if not observation.valid:
-                    continue
-                try:
-                    rays.append(build_camera_ray_from_observation(observation))
-                except (TypeError, ValueError) as exc:
-                    observation.valid = False
-                    observation.reason = f"failed to construct bearing ray: {exc}"
+            # A camera may miss the mannequin while the other cameras see it.
+            # Keep that observation invalid, but continue constructing rays
+            # from every available camera in this synchronized capture.
+            rays = build_rays_from_available_observations(observations)
 
             partial_fusion = fuse_rays(rays)
             valid_observation_count = sum(observation.valid for observation in observations)
@@ -703,11 +886,47 @@ def main() -> None:
                 fusion_evaluation=fusion_evaluation,
                 settled=settled,
                 image_paths=image_paths,
+                raw_image_paths=raw_image_paths,
+                raw_bbox_paths=raw_bbox_paths,
+                raw_camera_params_paths=raw_camera_params_paths,
             )
             schema_v2_output.write(
                 json.dumps(schema_v2_record, separators=(",", ":"), allow_nan=False) + "\n"
             )
             schema_v2_output.flush()
+            raw_manifest_record = {
+                "manifest_version": 1,
+                "capture_id": scene_index,
+                "scene_index": scene_index,
+                "background_path": str(background_path),
+                "target_prim_path": MANNEQUIN_PATH,
+                "target_label": args.target_label,
+                "resolution": list(render_resolution),
+                "rt_subframes": args.rt_subframes,
+                "settled": bool(settled),
+                "cameras": [
+                    {
+                        "camera_path": observation.camera_path,
+                        "render_product_name": render_product_name,
+                        "rgb_path": str(raw_paths["rgb"]),
+                        "bbox_path": str(raw_paths["bbox"]),
+                        "bbox_labels_path": str(raw_paths["bbox_labels"]),
+                        "bbox_prim_paths_path": str(raw_paths["bbox_prim_paths"]),
+                        "camera_params_path": str(raw_paths["camera_params"]),
+                        "annotated_image_path": image_paths[camera_index],
+                        "bbox": observation.bbox.as_dict()
+                        if observation.bbox is not None
+                        else None,
+                    }
+                    for camera_index, (observation, render_product_name, raw_paths) in enumerate(
+                        zip(observations, render_product_names, raw_capture_paths)
+                    )
+                ],
+            }
+            raw_manifest_output.write(
+                json.dumps(raw_manifest_record, separators=(",", ":"), allow_nan=False) + "\n"
+            )
+            raw_manifest_output.flush()
             if legacy_output is not None:
                 legacy_record = build_ground_truth_record(
                     scene_index=scene_index,
@@ -751,6 +970,21 @@ def main() -> None:
             schema_v2_output.close()
         if legacy_output is not None:
             legacy_output.close()
+        if raw_manifest_output is not None:
+            raw_manifest_output.close()
+        if writer is not None:
+            try:
+                rep.orchestrator.wait_until_complete()
+            except Exception:
+                pass
+            try:
+                writer.detach()
+            except Exception:
+                pass
+        try:
+            set_render_product_updates(render_products, False)
+        except Exception:
+            pass
         for annotator in bbox_annotators:
             try:
                 annotator.detach()

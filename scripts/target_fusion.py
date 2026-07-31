@@ -586,6 +586,28 @@ def build_camera_ray_from_observation(observation: CameraObservation) -> CameraR
     return build_camera_ray_from_pixel(observation.calibration, observation.bbox.center_uv)
 
 
+def build_rays_from_available_observations(
+    observations: Sequence[CameraObservation],
+) -> list[CameraRay]:
+    """Build rays for every visible camera and retain failures per observation.
+
+    A target can be outside one camera's view while remaining visible in the
+    others. Invalid observations are skipped, not fatal to the remaining ray
+    construction. The caller can then decide whether the available geometry
+    is sufficient for fusion.
+    """
+    rays = []
+    for observation in observations:
+        if not observation.valid:
+            continue
+        try:
+            rays.append(build_camera_ray_from_observation(observation))
+        except (TypeError, ValueError) as exc:
+            observation.valid = False
+            observation.reason = f"failed to construct bearing ray: {exc}"
+    return rays
+
+
 @dataclass
 class FusionResult:
     """Result and diagnostics from least-squares ray intersection."""
@@ -1208,13 +1230,23 @@ def build_schema_v2_record(
     fusion_evaluation: FusionEvaluation | None,
     settled: bool,
     image_paths: Sequence[str] | None = None,
+    raw_image_paths: Sequence[str] | None = None,
+    raw_bbox_paths: Sequence[str] | None = None,
+    raw_camera_params_paths: Sequence[str] | None = None,
 ) -> dict:
     """Build schema-v2 output with observations and inferred geometry separate."""
     validated_resolution = _coerce_resolution(resolution)
     if len(observations) != 4:
         raise ValueError("schema-v2 records require exactly four camera observations")
-    if image_paths is not None and len(image_paths) != len(observations):
-        raise ValueError("image_paths must contain one path per camera observation")
+    path_fields = {
+        "image_paths": image_paths,
+        "raw_image_paths": raw_image_paths,
+        "raw_bbox_paths": raw_bbox_paths,
+        "raw_camera_params_paths": raw_camera_params_paths,
+    }
+    for field_name, paths in path_fields.items():
+        if paths is not None and len(paths) != len(observations):
+            raise ValueError(f"{field_name} must contain one path per camera observation")
     if not isinstance(fusion_result, FusionResult):
         raise TypeError("fusion_result must be a FusionResult")
     if fusion_evaluation is not None and not isinstance(fusion_evaluation, FusionEvaluation):
@@ -1242,6 +1274,14 @@ def build_schema_v2_record(
         observation_dict = observation.as_dict()
         if image_paths is not None:
             observation_dict["image_path"] = str(image_paths[observation_index])
+        if raw_image_paths is not None:
+            observation_dict["raw_image_path"] = str(raw_image_paths[observation_index])
+        if raw_bbox_paths is not None:
+            observation_dict["raw_bbox_path"] = str(raw_bbox_paths[observation_index])
+        if raw_camera_params_paths is not None:
+            observation_dict["raw_camera_params_path"] = str(
+                raw_camera_params_paths[observation_index]
+            )
         observation_dicts.append(observation_dict)
         ray = ray_by_camera.pop(observation.camera_path, None)
         reason = observation.reason

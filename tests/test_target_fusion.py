@@ -13,6 +13,7 @@ from scripts.target_fusion import (
     FusionResult,
     build_camera_ray_from_observation,
     build_camera_ray_from_pixel,
+    build_rays_from_available_observations,
     extract_target_bbox,
     build_ground_truth_ray,
     build_ground_truth_record,
@@ -22,7 +23,11 @@ from scripts.target_fusion import (
     normalize,
 )
 from scripts.report_target_fusion import summarize_records
-from scripts.cycle_ground_backgrounds import save_annotated_capture_image
+from scripts.cycle_ground_backgrounds import (
+    basic_writer_capture_paths,
+    capture_synchronized_camera_views,
+    save_annotated_capture_image,
+)
 
 
 class TargetFusionMathTests(unittest.TestCase):
@@ -181,6 +186,38 @@ class TargetFusionMathTests(unittest.TestCase):
         )
         ray = build_camera_ray_from_observation(observation)
         np.testing.assert_allclose(ray.direction_world, [0.0, 0.0, -1.0])
+
+    def test_available_observations_still_generate_rays_when_one_camera_misses(self) -> None:
+        observations = []
+        for index, origin in enumerate(self.origins):
+            path = f"camera_{index}"
+            calibration = CameraCalibration(
+                camera_path=path,
+                resolution=(640, 480),
+                focal_length=20.0,
+                horizontal_aperture=20.0,
+                vertical_aperture=15.0,
+                origin_world=origin,
+            )
+            if index == 3:
+                bbox = BoundingBox2D(
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    resolution=(640, 480),
+                    valid=False,
+                    reason="target bbox not found",
+                )
+            else:
+                bbox = BoundingBox2D(310.0, 230.0, 330.0, 250.0, resolution=(640, 480))
+            observations.append(CameraObservation(path, calibration, bbox, capture_id=3))
+
+        rays = build_rays_from_available_observations(observations)
+
+        self.assertEqual([ray.camera_path for ray in rays], ["camera_0", "camera_1", "camera_2"])
+        self.assertFalse(observations[3].valid)
+        self.assertEqual(observations[3].bbox.reason, "target bbox not found")
 
     def test_invalid_observation_cannot_build_ray(self) -> None:
         calibration = CameraCalibration(
@@ -439,6 +476,10 @@ class TargetFusionMathTests(unittest.TestCase):
             fusion_result=fusion_result,
             fusion_evaluation=evaluation,
             settled=True,
+            image_paths=[f"annotated_{index}.png" for index in range(4)],
+            raw_image_paths=[f"raw_rgb_{index}.png" for index in range(4)],
+            raw_bbox_paths=[f"raw_bbox_{index}.npy" for index in range(4)],
+            raw_camera_params_paths=[f"camera_params_{index}.json" for index in range(4)],
         )
         decoded = json.loads(json.dumps(record, allow_nan=False))
         self.assertEqual(decoded["schema_version"], 2)
@@ -446,6 +487,13 @@ class TargetFusionMathTests(unittest.TestCase):
         self.assertEqual(len(decoded["inferred_rays"]), 4)
         self.assertEqual(decoded["capture"]["valid_camera_count"], 4)
         self.assertIsNone(decoded["inferred_rays"][0]["ray"]["target_distance_m"])
+        self.assertEqual(decoded["camera_observations"][0]["image_path"], "annotated_0.png")
+        self.assertEqual(decoded["camera_observations"][0]["raw_image_path"], "raw_rgb_0.png")
+        self.assertEqual(decoded["camera_observations"][0]["raw_bbox_path"], "raw_bbox_0.npy")
+        self.assertEqual(
+            decoded["camera_observations"][0]["raw_camera_params_path"],
+            "camera_params_0.json",
+        )
         self.assertIn("ground_truth_evaluation", decoded)
         self.assertNotIn("target_center_world", decoded)
 
@@ -583,6 +631,212 @@ class TargetFusionMathTests(unittest.TestCase):
 
             with Image.open(output_path) as image:
                 self.assertEqual(image.size, (32, 24))
+
+
+class SynchronizedCaptureTests(unittest.TestCase):
+    def test_basic_writer_paths_match_common_output_layout(self) -> None:
+        paths = basic_writer_capture_paths(
+            Path("outputs/sdg_raw"),
+            "TargetFusion_Camera_01",
+            7,
+        )
+        self.assertEqual(
+            paths["rgb"],
+            Path("outputs/sdg_raw/rgb/TargetFusion_Camera_01_rgb_000007.png").resolve(),
+        )
+        self.assertEqual(
+            paths["bbox"],
+            Path(
+                "outputs/sdg_raw/bounding_box_2d_tight/"
+                "TargetFusion_Camera_01_bounding_box_2d_tight_000007.npy"
+            ).resolve(),
+        )
+        self.assertEqual(
+            paths["camera_params"],
+            Path("outputs/sdg_raw/camera_params/TargetFusion_Camera_01_camera_params_000007.json").resolve(),
+        )
+
+    def test_basic_writer_paths_reject_path_like_render_product_names(self) -> None:
+        with self.assertRaisesRegex(ValueError, "filename-safe"):
+            basic_writer_capture_paths(Path("outputs"), "camera/01", 0)
+
+    def test_all_camera_buffers_are_served_by_one_orchestrator_step(self) -> None:
+        events = []
+
+        class FakeOrchestrator:
+            def step(self, **kwargs):
+                events.append(("step", kwargs))
+
+        class FakeAnnotator:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def get_data(self):
+                events.append("read")
+                return self.payload
+
+        bbox_dtype = [
+            ("semanticId", np.uint32),
+            ("x_min", np.int32),
+            ("y_min", np.int32),
+            ("x_max", np.int32),
+            ("y_max", np.int32),
+            ("occlusionRatio", np.float32),
+        ]
+        bbox_payload = {
+            "data": np.array([(5, 10, 20, 31, 42, 0.0)], dtype=bbox_dtype),
+            "info": {"idToLabels": {"5": {"class": "mannequin"}}},
+        }
+        rgb_payload = {"data": np.zeros((2, 2, 3), dtype=np.uint8)}
+        bbox_annotators = [
+            FakeAnnotator(bbox_payload),
+            FakeAnnotator(bbox_payload),
+        ]
+        rgb_annotators = [
+            FakeAnnotator(rgb_payload),
+            FakeAnnotator(rgb_payload),
+        ]
+
+        target_bboxes, rgb_frames = capture_synchronized_camera_views(
+            FakeOrchestrator(),
+            bbox_annotators,
+            rgb_annotators,
+            rt_subframes=2,
+            render_resolution=(640, 480),
+            target_label="mannequin",
+            max_occlusion_ratio=None,
+            border_tolerance_px=0.0,
+        )
+
+        self.assertEqual(len(target_bboxes), 2)
+        self.assertEqual(len(rgb_frames), 2)
+        self.assertTrue(all(bbox.valid for bbox in target_bboxes))
+        self.assertEqual(events[0], ("step", {
+            "delta_time": 0.0,
+            "rt_subframes": 2,
+            "pause_timeline": True,
+            "wait_for_render": True,
+        }))
+        self.assertEqual(events[1:], ["read"] * 4)
+
+    def test_capture_leaves_render_products_enabled_for_writer_lifecycle(self) -> None:
+        events = []
+
+        class FakeHydraTexture:
+            def __init__(self, name):
+                self.name = name
+
+            def set_updates_enabled(self, enabled):
+                events.append((self.name, enabled))
+
+        class FakeRenderProduct:
+            def __init__(self, name):
+                self.hydra_texture = FakeHydraTexture(name)
+
+        class FakeOrchestrator:
+            def step(self, **kwargs):
+                events.append(("step", kwargs))
+
+        class FakeAnnotator:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def get_data(self):
+                return self.payload
+
+        bbox_dtype = [
+            ("semanticId", np.uint32),
+            ("x_min", np.int32),
+            ("y_min", np.int32),
+            ("x_max", np.int32),
+            ("y_max", np.int32),
+            ("occlusionRatio", np.float32),
+        ]
+        bbox_payload = {
+            "data": np.array([(5, 10, 20, 31, 42, 0.0)], dtype=bbox_dtype),
+            "info": {"idToLabels": {"5": {"class": "mannequin"}}},
+        }
+        rgb_payload = {"data": np.zeros((2, 2, 3), dtype=np.uint8)}
+        capture_synchronized_camera_views(
+            FakeOrchestrator(),
+            [FakeAnnotator(bbox_payload), FakeAnnotator(bbox_payload)],
+            [FakeAnnotator(rgb_payload), FakeAnnotator(rgb_payload)],
+            render_products=[FakeRenderProduct("camera_01"), FakeRenderProduct("camera_02")],
+            rt_subframes=1,
+            render_resolution=(640, 480),
+            target_label="mannequin",
+            max_occlusion_ratio=None,
+            border_tolerance_px=0.0,
+        )
+
+        self.assertEqual(events, [
+            ("step", {
+                "delta_time": 0.0,
+                "rt_subframes": 1,
+                "pause_timeline": True,
+                "wait_for_render": True,
+            }),
+        ])
+
+    def test_capture_keeps_all_rgb_frames_when_one_bbox_is_missing(self) -> None:
+        events = []
+
+        class FakeOrchestrator:
+            def step(self, **kwargs):
+                events.append(("step", kwargs))
+
+        class FakeAnnotator:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def get_data(self):
+                events.append("read")
+                return self.payload
+
+        bbox_dtype = [
+            ("semanticId", np.uint32),
+            ("x_min", np.int32),
+            ("y_min", np.int32),
+            ("x_max", np.int32),
+            ("y_max", np.int32),
+            ("occlusionRatio", np.float32),
+        ]
+        rows = np.array([(5, 10, 20, 31, 42, 0.0)], dtype=bbox_dtype)
+        visible_payload = {
+            "data": rows,
+            "info": {"idToLabels": {"5": {"class": "mannequin"}}},
+        }
+        missing_payload = {
+            "data": rows,
+            "info": {"idToLabels": {"5": {"class": "other"}}},
+        }
+        bbox_annotators = [
+            FakeAnnotator(visible_payload),
+            FakeAnnotator(visible_payload),
+            FakeAnnotator(missing_payload),
+            FakeAnnotator(visible_payload),
+        ]
+        rgb_annotators = [
+            FakeAnnotator({"data": np.zeros((2, 2, 3), dtype=np.uint8)})
+            for _ in range(4)
+        ]
+
+        target_bboxes, rgb_frames = capture_synchronized_camera_views(
+            FakeOrchestrator(),
+            bbox_annotators,
+            rgb_annotators,
+            rt_subframes=1,
+            render_resolution=(640, 480),
+            target_label="mannequin",
+            max_occlusion_ratio=None,
+            border_tolerance_px=0.0,
+        )
+
+        self.assertEqual(len(target_bboxes), 4)
+        self.assertEqual(sum(bbox.valid for bbox in target_bboxes), 3)
+        self.assertEqual(len(rgb_frames), 4)
+        self.assertEqual(events[0][0], "step")
+        self.assertEqual(events[1:], ["read"] * 8)
 
 
 if __name__ == "__main__":

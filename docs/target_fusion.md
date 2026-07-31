@@ -4,8 +4,10 @@
 USD perspective cameras. Each camera produces a synchronized
 `bounding_box_2d_tight` annotation. The floating-point box center is
 back-projected through the camera's actual USD intrinsics and pose to form one
-world-space bearing ray. A scene is valid only when all four boxes are valid
-and the ray geometry passes the rank, conditioning, and forward-distance
+world-space bearing ray. If the mannequin is outside one camera's view, that
+camera remains part of the synchronized capture while rays are still built
+from the visible cameras. A scene is marked valid only when all four boxes are
+valid and the ray geometry passes the rank, conditioning, and forward-distance
 checks.
 
 The default output is schema v2:
@@ -20,6 +22,13 @@ Each synchronized camera view is also saved as an annotated PNG under
 `--image-output-dir PATH`; the corresponding path is recorded in each schema-v2
 camera observation.
 
+The same synchronized step is attached to an Isaac Replicator `BasicWriter`.
+Clean RGB frames and Isaac-native tight bbox artifacts are written under
+`outputs/sdg_raw/` by default. Override that location with
+`--raw-output-dir PATH`. Use `--frames N` to generate exactly `N` captures;
+backgrounds repeat in stable filename order when `N` exceeds the number of
+available PNGs.
+
 The GUI cycle is deliberately ordered as: randomize the background, randomize
 the mannequin pose and settle it, fire the synchronized four-camera capture,
 pause the timeline for inspection, then clear all transient rays and markers
@@ -33,15 +42,94 @@ needed. Summarize either format with:
 python3 scripts/report_target_fusion.py outputs/target_fusion_bbox_v2.jsonl
 ```
 
+The raw SDG directory keeps training images separate from visual diagnostics:
+
+```text
+sdg_raw/
+  manifest.jsonl
+  rgb/TargetFusion_Camera_01_rgb_000000.png
+  bounding_box_2d_tight/TargetFusion_Camera_01_bounding_box_2d_tight_000000.npy
+  bounding_box_2d_tight/TargetFusion_Camera_01_bounding_box_2d_tight_labels_000000.json
+  bounding_box_2d_tight/TargetFusion_Camera_01_bounding_box_2d_tight_prim_paths_000000.json
+  camera_params/TargetFusion_Camera_01_camera_params_000000.json
+```
+
+The four camera render products are attached to one `BasicWriter`, with RGB,
+tight 2D boxes, and camera parameters enabled. The schema-v2 observation
+stores both `image_path` (annotated preview) and the corresponding raw paths
+(`raw_image_path`, `raw_bbox_path`, and `raw_camera_params_path`). The raw
+manifest records the same pairing for later YOLO export.
+
+## Export a YOLO dataset
+
+After capture, export the clean RGB frames and selected mannequin boxes with:
+
+```bash
+python3 scripts/export_yolo_dataset.py \
+  --schema-v2-output outputs/target_fusion_bbox_v2.jsonl \
+  --output-dir outputs/yolo_mannequin \
+  --overwrite
+```
+
+The exporter writes the standard layout:
+
+```text
+yolo_mannequin/
+  data.yaml
+  manifest.jsonl
+  train/images/  train/labels/
+  val/images/    val/labels/
+  test/images/   test/labels/
+```
+
+Each label row is `class_id x_center y_center width height`, normalized to
+`[0, 1]`, with class `0` equal to `mannequin`. Empty camera views still get a
+copied image and an empty label file. Positive clipped boxes are clamped to
+the image bounds and retained; the original and clamped pixel boxes, export
+status, and source validity are recorded in `manifest.jsonl`.
+
+Splits are assigned from `capture_id` as a group, so the four synchronized
+camera views from one capture always remain in the same split. The default
+split probabilities are train/val/test = 70/20/10. Use `--append` to add new
+captures while preserving existing class and group assignments.
+
+Validate the exported dataset and generate visual previews with:
+
+```bash
+python3 scripts/validate_yolo_dataset.py \
+  --dataset-dir outputs/yolo_mannequin \
+  --report-path outputs/yolo_mannequin/validation.json
+
+python3 scripts/visualize_yolo_dataset.py \
+  --dataset-dir outputs/yolo_mannequin \
+  --split train --limit 16 \
+  --output-dir outputs/yolo_mannequin/previews
+```
+
+Validation reports missing pairs, malformed or out-of-range rows, manifest
+drift, and any capture group assigned to more than one split. Empty `val` or
+`test` splits are warnings during smoke tests and can be made failures with
+`--strict`.
+
+The architecture-only stress suite exercises a 192-view synthetic fixture,
+compares two fresh exports for deterministic output, verifies append/resume
+split preservation, and rejects duplicate source captures:
+
+```bash
+python3 -B -m unittest discover -s tests -v
+```
+
 ## Interpreting the estimate
 
 The estimate is a visual-center estimate, not a guaranteed geometric center
 of the mannequin. Silhouette and bounding-box centers can differ between
 views, so valid rays can retain a nonzero RMS residual and position error.
 Boxes that are clipped, missing, zero-area, malformed, or too occluded are
-rejected because their centers are systematically displaced. Poor camera
-geometry is reported through minimum pairwise ray angle, matrix rank, and
-condition number rather than silently accepted.
+rejected because their centers are systematically displaced. Rejected cameras
+remain in the record, while rays from the other valid cameras are retained for
+diagnostics and downstream use. Poor camera geometry is reported through
+minimum pairwise ray angle, matrix rank, and condition number rather than
+silently accepted.
 
 Ground-truth bounds are used only for camera setup validation and the separate
 `ground_truth_evaluation` output block. The observation interface keeps
