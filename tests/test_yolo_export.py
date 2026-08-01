@@ -158,6 +158,43 @@ class YoloDatasetExportTests(unittest.TestCase):
         )
         return schema_path
 
+    def test_export_prefers_processed_training_image_and_falls_back_to_raw(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            schema_path = self._write_schema(root, capture_count=3)
+            records = [json.loads(line) for line in schema_path.read_text().splitlines()]
+            training_image = root / "processed" / "capture_0_camera_0.png"
+            training_image.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (100, 80), color=(220, 15, 35)).save(training_image)
+            records[0]["camera_observations"][0]["training_image_path"] = str(
+                training_image.relative_to(root)
+            )
+            schema_path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            output_dir = root / "yolo"
+            export_dataset(schema_path, output_dir, overwrite=True, split_seed=9)
+            manifest_items = [
+                json.loads(line)
+                for line in (output_dir / "manifest.jsonl").read_text().splitlines()
+            ]
+            processed_item = next(
+                item
+                for item in manifest_items
+                if item["capture_group_id"] == "0" and item["camera_index"] == 0
+            )
+            fallback_item = next(
+                item
+                for item in manifest_items
+                if item["capture_group_id"] == "0" and item["camera_index"] == 1
+            )
+            self.assertEqual(processed_item["source_image_field"], "training_image_path")
+            self.assertEqual(fallback_item["source_image_field"], "raw_image_path")
+            with Image.open(output_dir / processed_item["image_path"]) as exported_image:
+                self.assertEqual(exported_image.convert("RGB").getpixel((0, 0)), (220, 15, 35))
+
     def test_export_writes_clean_images_empty_labels_and_grouped_splits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

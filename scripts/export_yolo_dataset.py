@@ -3,13 +3,14 @@
 The capture script writes two kinds of images:
 
 * ``image_path`` points to an annotated diagnostic preview.
+* ``training_image_path`` points to the unannotated noise-processed frame.
 * ``raw_image_path`` points to the clean Isaac BasicWriter RGB frame.
 
-This exporter deliberately uses the clean image and the target bbox selected
-by the schema-v2 capture.  It does not read the annotated preview or trust
-fusion validity as a detection-quality gate.  A camera view with no visible
-target still gets an image and an empty label file, which makes it a valid
-YOLO negative example.
+This exporter prefers the noise-processed training image and falls back to the
+clean image for captures made before that field existed. It never reads the
+annotated preview or trusts fusion validity as a detection-quality gate. A
+camera view with no visible target still gets an image and an empty label file,
+which makes it a valid YOLO negative example.
 """
 
 from __future__ import annotations
@@ -604,16 +605,22 @@ def export_dataset(
                     raise ValueError(
                         f"capture record {record_index} camera {camera_index} is not an object"
                     )
+                training_image_value = observation.get("training_image_path")
                 raw_image_value = observation.get("raw_image_path")
-                if not raw_image_value:
+                source_image_value = training_image_value or raw_image_value
+                source_image_field = (
+                    "training_image_path" if training_image_value else "raw_image_path"
+                )
+                if not source_image_value:
                     raise ValueError(
-                        f"capture record {record_index} camera {camera_index} has no raw_image_path; "
-                        "regenerate captures with the BasicWriter output enabled"
+                        f"capture record {record_index} camera {camera_index} has neither "
+                        "training_image_path nor raw_image_path; regenerate the capture"
                     )
-                source_image_path = _resolve_source_path(raw_image_value, schema_path)
+                source_image_path = _resolve_source_path(source_image_value, schema_path)
                 if not source_image_path.is_file():
                     raise FileNotFoundError(
-                        f"raw RGB image for capture {record_index} camera {camera_index} does not exist: "
+                        f"{source_image_field} for capture {record_index} camera "
+                        f"{camera_index} does not exist: "
                         f"{source_image_path}"
                     )
                 image_width, image_height = _read_image_size(source_image_path)
@@ -663,6 +670,7 @@ def export_dataset(
                     "image_path": _relative_output_path(output_dir, destination_image),
                     "label_path": _relative_output_path(output_dir, destination_label),
                     "source_key": source_key,
+                    "source_image_field": source_image_field,
                     "source_image_path": str(source_image_path),
                     "source_bbox_path": observation.get("raw_bbox_path"),
                     "source_camera_params_path": observation.get("raw_camera_params_path"),

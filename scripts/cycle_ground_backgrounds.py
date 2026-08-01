@@ -48,12 +48,26 @@ MATERIAL_PATH = "/World/Looks/BackgroundSwapMaterial"
 MANNEQUIN_Z_OFFSET = 0.5
 SETTLE_SPEED_THRESHOLD = 0.02
 SETTLE_STABLE_SECONDS = 0.5
-DEFAULT_POSITION_NOISE_STD_M = (0.02, 0.02, 0.02)
+DEFAULT_POSITION_NOISE_STD_M = (0.01, 0.01, 0.01)
 POSITION_NOISE_SEED_SALT = 0x504F534E
-DEFAULT_RESOLUTION_NOISE_STD = 0.15
-MIN_RESOLUTION_NOISE_SCALE = 0.5
-MAX_RESOLUTION_NOISE_SCALE = 1.5
+DEFAULT_RESOLUTION_NOISE_STD = 0.10
+MIN_RESOLUTION_NOISE_SCALE = 0.75
+MAX_RESOLUTION_NOISE_SCALE = 1.25
 RESOLUTION_NOISE_SEED_SALT = 0x5245534E
+DEFAULT_BRIGHTNESS_NOISE_STD = 0.025
+MIN_BRIGHTNESS_OFFSET = -0.10
+MAX_BRIGHTNESS_OFFSET = 0.10
+DEFAULT_EXPOSURE_NOISE_STD_STOPS = 0.15
+MIN_EXPOSURE_STOPS = -0.5
+MAX_EXPOSURE_STOPS = 0.5
+BASE_COLOR_TEMPERATURE_K = 6500.0
+DEFAULT_COLOR_TEMPERATURE_NOISE_STD_K = 300.0
+MIN_COLOR_TEMPERATURE_K = 4500.0
+MAX_COLOR_TEMPERATURE_K = 8500.0
+PHOTOMETRIC_NOISE_SEED_SALT = 0x50484F54
+DEFAULT_RGB_PIXEL_NOISE_STD = 5.0
+MAX_RGB_PIXEL_NOISE_STD = 64.0
+RGB_PIXEL_NOISE_SEED_SALT = 0x5247424E
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,8 +130,8 @@ def parse_args() -> argparse.Namespace:
         "--sensor-noise",
         action="store_true",
         help=(
-            "Add reproducible Gaussian noise to each requested world position "
-            "(default: disabled)"
+            "Enable reproducible Gaussian position, resolution, brightness, exposure, "
+            "color-temperature, and RGB pixel noise (default: disabled)"
         ),
     )
     parser.add_argument(
@@ -128,7 +142,7 @@ def parse_args() -> argparse.Namespace:
         metavar=("STD_X", "STD_Y", "STD_Z"),
         help=(
             "Gaussian position-noise standard deviations in metres for X Y Z; "
-            "used with --sensor-noise (default: 0.02 0.02 0.02)"
+            "used with --sensor-noise (default: 0.01 0.01 0.01)"
         ),
     )
     parser.add_argument(
@@ -137,7 +151,46 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_RESOLUTION_NOISE_STD,
         help=(
             "Standard deviation of the Gaussian image-resolution scale around 1.0; "
-            "used with --sensor-noise and clamped to 0.5-1.5 (default: 0.15)"
+            "used with --sensor-noise and clamped to 0.75-1.25 (default: 0.10)"
+        ),
+    )
+    parser.add_argument(
+        "--brightness-noise-std",
+        type=float,
+        default=DEFAULT_BRIGHTNESS_NOISE_STD,
+        help=(
+            "Standard deviation of additive normalized RGB brightness noise; "
+            "used with --sensor-noise (default: 0.025)"
+        ),
+    )
+    parser.add_argument(
+        "--exposure-noise-std",
+        type=float,
+        default=DEFAULT_EXPOSURE_NOISE_STD_STOPS,
+        metavar="STOPS",
+        help=(
+            "Standard deviation of Gaussian exposure noise in photographic stops; "
+            "used with --sensor-noise (default: 0.15)"
+        ),
+    )
+    parser.add_argument(
+        "--color-temperature-noise-std",
+        type=float,
+        default=DEFAULT_COLOR_TEMPERATURE_NOISE_STD_K,
+        metavar="KELVIN",
+        help=(
+            "Standard deviation of Gaussian color temperature around 6500 K; "
+            "used with --sensor-noise (default: 300)"
+        ),
+    )
+    parser.add_argument(
+        "--rgb-pixel-noise-std",
+        type=float,
+        default=DEFAULT_RGB_PIXEL_NOISE_STD,
+        metavar="PIXEL_VALUE",
+        help=(
+            "Standard deviation of independent Gaussian RGB pixel noise in 8-bit "
+            "pixel units; used with --sensor-noise (default: 5.0)"
         ),
     )
     parser.add_argument(
@@ -386,6 +439,28 @@ def _coerce_resolution_noise_std(value) -> float:
     return standard_deviation
 
 
+def _coerce_photometric_noise_std(value, *, option_name: str) -> float:
+    """Validate one nonnegative photometric-noise standard deviation."""
+    standard_deviation = float(value)
+    if not math.isfinite(standard_deviation):
+        raise ValueError(f"{option_name} must be finite")
+    if standard_deviation < 0.0:
+        raise ValueError(f"{option_name} must be nonnegative")
+    return standard_deviation
+
+
+def _coerce_rgb_pixel_noise_std(value) -> float:
+    """Validate Gaussian RGB pixel noise in 8-bit pixel units."""
+    standard_deviation = float(value)
+    if not math.isfinite(standard_deviation):
+        raise ValueError("--rgb-pixel-noise-std must be finite")
+    if not 0.0 <= standard_deviation <= MAX_RGB_PIXEL_NOISE_STD:
+        raise ValueError(
+            f"--rgb-pixel-noise-std must be between 0 and {MAX_RGB_PIXEL_NOISE_STD:g}"
+        )
+    return standard_deviation
+
+
 def add_gaussian_position_noise(
     position,
     standard_deviation,
@@ -445,6 +520,123 @@ def apply_gaussian_resolution_noise(
     image = image.resize(intermediate_resolution, resample=Image.Resampling.LANCZOS)
     image = image.resize((width, height), resample=Image.Resampling.LANCZOS)
     return np.asarray(image), float(sampled_scale), intermediate_resolution
+
+
+def _color_temperature_rgb_gains(temperature_kelvin: float) -> np.ndarray:
+    """Approximate RGB illumination gains for a color temperature relative to D65."""
+
+    def kelvin_to_rgb(temperature: float) -> np.ndarray:
+        scaled_temperature = temperature / 100.0
+        if scaled_temperature <= 66.0:
+            red = 255.0
+            green = 99.4708025861 * math.log(scaled_temperature) - 161.1195681661
+            blue = (
+                0.0
+                if scaled_temperature <= 19.0
+                else 138.5177312231 * math.log(scaled_temperature - 10.0)
+                - 305.0447927307
+            )
+        else:
+            red = 329.698727446 * ((scaled_temperature - 60.0) ** -0.1332047592)
+            green = 288.1221695283 * ((scaled_temperature - 60.0) ** -0.0755148492)
+            blue = 255.0
+        return np.clip([red, green, blue], 0.0, 255.0).astype(np.float64)
+
+    temperature = float(temperature_kelvin)
+    if not math.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("color temperature must be a positive finite Kelvin value")
+    return kelvin_to_rgb(temperature) / kelvin_to_rgb(BASE_COLOR_TEMPERATURE_K)
+
+
+def apply_gaussian_photometric_noise(
+    rgb_data,
+    *,
+    brightness_standard_deviation: float,
+    exposure_standard_deviation_stops: float,
+    color_temperature_standard_deviation_k: float,
+    randomizer: random.Random,
+) -> tuple[np.ndarray, dict]:
+    """Apply seeded brightness, exposure, and white-balance variation to RGB data."""
+    image_array = np.asarray(rgb_data)
+    if image_array.ndim != 3 or image_array.shape[2] not in (3, 4):
+        raise ValueError(f"RGB frame must have 3 or 4 channels, got shape {image_array.shape}")
+    if not np.all(np.isfinite(image_array)):
+        raise ValueError("RGB frame must contain only finite pixels")
+    if np.issubdtype(image_array.dtype, np.floating):
+        scale_to_byte = 255.0 if float(np.max(image_array)) <= 1.0 else 1.0
+        image_array = np.clip(image_array * scale_to_byte, 0.0, 255.0).astype(np.uint8)
+    elif image_array.dtype != np.uint8:
+        image_array = np.clip(image_array, 0, 255).astype(np.uint8)
+
+    brightness_std = _coerce_photometric_noise_std(
+        brightness_standard_deviation,
+        option_name="--brightness-noise-std",
+    )
+    exposure_std = _coerce_photometric_noise_std(
+        exposure_standard_deviation_stops,
+        option_name="--exposure-noise-std",
+    )
+    temperature_std = _coerce_photometric_noise_std(
+        color_temperature_standard_deviation_k,
+        option_name="--color-temperature-noise-std",
+    )
+    brightness_offset = min(
+        MAX_BRIGHTNESS_OFFSET,
+        max(MIN_BRIGHTNESS_OFFSET, randomizer.gauss(0.0, brightness_std)),
+    )
+    exposure_stops = min(
+        MAX_EXPOSURE_STOPS,
+        max(MIN_EXPOSURE_STOPS, randomizer.gauss(0.0, exposure_std)),
+    )
+    color_temperature_k = min(
+        MAX_COLOR_TEMPERATURE_K,
+        max(
+            MIN_COLOR_TEMPERATURE_K,
+            randomizer.gauss(BASE_COLOR_TEMPERATURE_K, temperature_std),
+        ),
+    )
+    exposure_multiplier = 2.0**exposure_stops
+    rgb_gains = _color_temperature_rgb_gains(color_temperature_k)
+
+    output = image_array.copy()
+    adjusted_rgb = image_array[:, :, :3].astype(np.float64)
+    adjusted_rgb *= exposure_multiplier * rgb_gains.reshape((1, 1, 3))
+    adjusted_rgb += brightness_offset * 255.0
+    output[:, :, :3] = np.clip(np.rint(adjusted_rgb), 0.0, 255.0).astype(np.uint8)
+    return output, {
+        "brightness_offset": float(brightness_offset),
+        "exposure_stops": float(exposure_stops),
+        "exposure_multiplier": float(exposure_multiplier),
+        "color_temperature_k": float(color_temperature_k),
+        "rgb_gains": rgb_gains.tolist(),
+    }
+
+
+def apply_gaussian_rgb_pixel_noise(
+    rgb_data,
+    standard_deviation: float,
+    randomizer: np.random.Generator,
+) -> np.ndarray:
+    """Add independent Gaussian noise to each RGB channel while preserving alpha."""
+    image_array = np.asarray(rgb_data)
+    if image_array.ndim != 3 or image_array.shape[2] not in (3, 4):
+        raise ValueError(f"RGB frame must have 3 or 4 channels, got shape {image_array.shape}")
+    if not np.all(np.isfinite(image_array)):
+        raise ValueError("RGB frame must contain only finite pixels")
+    if np.issubdtype(image_array.dtype, np.floating):
+        scale_to_byte = 255.0 if float(np.max(image_array)) <= 1.0 else 1.0
+        image_array = np.clip(image_array * scale_to_byte, 0.0, 255.0).astype(np.uint8)
+    elif image_array.dtype != np.uint8:
+        image_array = np.clip(image_array, 0, 255).astype(np.uint8)
+
+    std = _coerce_rgb_pixel_noise_std(standard_deviation)
+    output = image_array.copy()
+    if std == 0.0:
+        return output
+    noise = randomizer.normal(0.0, std, size=image_array[:, :, :3].shape)
+    noisy_rgb = image_array[:, :, :3].astype(np.float64) + noise
+    output[:, :, :3] = np.clip(np.rint(noisy_rgb), 0.0, 255.0).astype(np.uint8)
+    return output
 
 
 def _coerce_pose_orientation(
@@ -878,6 +1070,28 @@ def save_annotated_capture_image(
     image.save(output_path, format="PNG")
 
 
+def save_training_capture_image(rgb_data, output_path: Path) -> None:
+    """Save one unannotated, noise-processed RGB frame for model training."""
+    from PIL import Image
+
+    if rgb_data is None:
+        raise RuntimeError(f"RGB annotator returned no image for {output_path.name}")
+    image_array = np.asarray(rgb_data)
+    if image_array.ndim != 3 or image_array.shape[2] not in (3, 4):
+        raise RuntimeError(
+            f"RGB annotator returned unsupported shape {image_array.shape} for {output_path.name}"
+        )
+    if not np.all(np.isfinite(image_array)):
+        raise RuntimeError(f"RGB annotator returned nonfinite pixels for {output_path.name}")
+    if np.issubdtype(image_array.dtype, np.floating):
+        scale = 255.0 if float(np.nanmax(image_array)) <= 1.0 else 1.0
+        image_array = np.clip(image_array * scale, 0.0, 255.0).astype(np.uint8)
+    elif image_array.dtype != np.uint8:
+        image_array = np.clip(image_array, 0, 255).astype(np.uint8)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(image_array[:, :, :3], mode="RGB").save(output_path, format="PNG")
+
+
 def build_camera_calibration(stage, camera_path: str, resolution):
     """Snapshot USD pinhole calibration and camera-to-world rotation."""
     from pxr import Gf, Usd, UsdGeom
@@ -959,6 +1173,19 @@ def main() -> None:
     validate_pose_options(args)
     position_noise_std = _coerce_position_noise_std(args.position_noise_std)
     resolution_noise_std = _coerce_resolution_noise_std(args.resolution_noise_std)
+    brightness_noise_std = _coerce_photometric_noise_std(
+        args.brightness_noise_std,
+        option_name="--brightness-noise-std",
+    )
+    exposure_noise_std = _coerce_photometric_noise_std(
+        args.exposure_noise_std,
+        option_name="--exposure-noise-std",
+    )
+    color_temperature_noise_std = _coerce_photometric_noise_std(
+        args.color_temperature_noise_std,
+        option_name="--color-temperature-noise-std",
+    )
+    rgb_pixel_noise_std = _coerce_rgb_pixel_noise_std(args.rgb_pixel_noise_std)
     if args.settle_timeout <= 0:
         raise ValueError("--settle-timeout must be greater than zero")
     if args.scene_hold_seconds < 0:
@@ -1122,6 +1349,10 @@ def main() -> None:
         randomizer = random.Random(args.seed)
         position_noise_randomizer = random.Random(args.seed ^ POSITION_NOISE_SEED_SALT)
         resolution_noise_randomizer = random.Random(args.seed ^ RESOLUTION_NOISE_SEED_SALT)
+        photometric_noise_randomizer = random.Random(args.seed ^ PHOTOMETRIC_NOISE_SEED_SALT)
+        rgb_pixel_noise_randomizer = np.random.default_rng(
+            (int(args.seed) ^ RGB_PIXEL_NOISE_SEED_SALT) & ((1 << 64) - 1)
+        )
 
         # Establish fixed camera poses once. The target height comes from the
         # authored mannequin bounds plus the constant scene translation; the
@@ -1187,6 +1418,15 @@ def main() -> None:
             f"Gaussian resolution noise: {'enabled' if args.sensor_noise else 'disabled'} "
             f"scale_std={resolution_noise_std} "
             f"limits=({MIN_RESOLUTION_NOISE_SCALE}, {MAX_RESOLUTION_NOISE_SCALE})"
+        )
+        print(
+            f"Gaussian photometric noise: {'enabled' if args.sensor_noise else 'disabled'} "
+            f"brightness_std={brightness_noise_std} exposure_std_stops={exposure_noise_std} "
+            f"color_temperature_std_k={color_temperature_noise_std}"
+        )
+        print(
+            f"Gaussian RGB pixel noise: {'enabled' if args.sensor_noise else 'disabled'} "
+            f"std_8bit={rgb_pixel_noise_std}"
         )
         schema_v2_output_path = args.schema_v2_output.expanduser().resolve()
         if schema_v2_output_path == world_path or schema_v2_output_path in backgrounds:
@@ -1397,6 +1637,45 @@ def main() -> None:
                     }
                     for camera_path in args.camera_prims
                 ]
+            photometric_noise_samples = []
+            if args.sensor_noise:
+                photometric_rgb_frames = []
+                for camera_path, rgb_frame in zip(args.camera_prims, rgb_frames):
+                    noisy_frame, photometric_sample = apply_gaussian_photometric_noise(
+                        rgb_frame,
+                        brightness_standard_deviation=brightness_noise_std,
+                        exposure_standard_deviation_stops=exposure_noise_std,
+                        color_temperature_standard_deviation_k=(
+                            color_temperature_noise_std
+                        ),
+                        randomizer=photometric_noise_randomizer,
+                    )
+                    photometric_rgb_frames.append(noisy_frame)
+                    photometric_noise_samples.append(
+                        {"camera_path": camera_path, **photometric_sample}
+                    )
+                rgb_frames = photometric_rgb_frames
+            else:
+                photometric_noise_samples = [
+                    {
+                        "camera_path": camera_path,
+                        "brightness_offset": 0.0,
+                        "exposure_stops": 0.0,
+                        "exposure_multiplier": 1.0,
+                        "color_temperature_k": BASE_COLOR_TEMPERATURE_K,
+                        "rgb_gains": [1.0, 1.0, 1.0],
+                    }
+                    for camera_path in args.camera_prims
+                ]
+            if args.sensor_noise:
+                rgb_frames = [
+                    apply_gaussian_rgb_pixel_noise(
+                        rgb_frame,
+                        rgb_pixel_noise_std,
+                        rgb_pixel_noise_randomizer,
+                    )
+                    for rgb_frame in rgb_frames
+                ]
             yolo_inference_results = None
             if args.yolo_comparison_mode == "same-time":
                 yolo_inference_results = infer_yolo_frames(
@@ -1408,7 +1687,13 @@ def main() -> None:
                     device=args.yolo_device,
                 )
             image_paths = []
+            training_image_paths = []
             for camera_index, (rgb_frame, bbox) in enumerate(zip(rgb_frames, target_bboxes)):
+                training_image_path = image_output_dir / "training" / (
+                    f"scene_{scene_index:04d}_camera_{camera_index + 1:02d}.png"
+                )
+                save_training_capture_image(rgb_frame, training_image_path)
+                training_image_paths.append(str(training_image_path))
                 image_path = image_output_dir / (
                     f"scene_{scene_index:04d}_camera_{camera_index + 1:02d}.png"
                 )
@@ -1606,6 +1891,7 @@ def main() -> None:
                 fusion_evaluation=fusion_evaluation,
                 settled=settled,
                 image_paths=image_paths,
+                training_image_paths=training_image_paths,
                 raw_image_paths=raw_image_paths,
                 raw_bbox_paths=raw_bbox_paths,
                 raw_camera_params_paths=raw_camera_params_paths,
@@ -1625,6 +1911,19 @@ def main() -> None:
                     MAX_RESOLUTION_NOISE_SCALE,
                 ],
                 "resolution_samples": resolution_noise_samples,
+                "brightness_standard_deviation": brightness_noise_std,
+                "brightness_limits": [MIN_BRIGHTNESS_OFFSET, MAX_BRIGHTNESS_OFFSET],
+                "exposure_standard_deviation_stops": exposure_noise_std,
+                "exposure_limits_stops": [MIN_EXPOSURE_STOPS, MAX_EXPOSURE_STOPS],
+                "color_temperature_mean_k": BASE_COLOR_TEMPERATURE_K,
+                "color_temperature_standard_deviation_k": color_temperature_noise_std,
+                "color_temperature_limits_k": [
+                    MIN_COLOR_TEMPERATURE_K,
+                    MAX_COLOR_TEMPERATURE_K,
+                ],
+                "photometric_samples": photometric_noise_samples,
+                "rgb_pixel_distribution": "gaussian",
+                "rgb_pixel_standard_deviation_8bit": rgb_pixel_noise_std,
             }
             if fusion_comparison is not None:
                 attach_yolo_comparison_record(
@@ -1661,6 +1960,19 @@ def main() -> None:
                         MAX_RESOLUTION_NOISE_SCALE,
                     ],
                     "resolution_samples": resolution_noise_samples,
+                    "brightness_standard_deviation": brightness_noise_std,
+                    "brightness_limits": [MIN_BRIGHTNESS_OFFSET, MAX_BRIGHTNESS_OFFSET],
+                    "exposure_standard_deviation_stops": exposure_noise_std,
+                    "exposure_limits_stops": [MIN_EXPOSURE_STOPS, MAX_EXPOSURE_STOPS],
+                    "color_temperature_mean_k": BASE_COLOR_TEMPERATURE_K,
+                    "color_temperature_standard_deviation_k": color_temperature_noise_std,
+                    "color_temperature_limits_k": [
+                        MIN_COLOR_TEMPERATURE_K,
+                        MAX_COLOR_TEMPERATURE_K,
+                    ],
+                    "photometric_samples": photometric_noise_samples,
+                    "rgb_pixel_distribution": "gaussian",
+                    "rgb_pixel_standard_deviation_8bit": rgb_pixel_noise_std,
                 },
                 "settled": bool(settled),
                 "pose": pose_metadata,
@@ -1674,6 +1986,7 @@ def main() -> None:
                         "bbox_prim_paths_path": str(raw_paths["bbox_prim_paths"]),
                         "camera_params_path": str(raw_paths["camera_params"]),
                         "annotated_image_path": image_paths[camera_index],
+                        "training_image_path": training_image_paths[camera_index],
                         "bbox": observation.bbox.as_dict()
                         if observation.bbox is not None
                         else None,

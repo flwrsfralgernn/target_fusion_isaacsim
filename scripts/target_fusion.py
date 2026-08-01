@@ -1264,6 +1264,7 @@ def build_schema_v2_record(
     fusion_evaluation: FusionEvaluation | None,
     settled: bool,
     image_paths: Sequence[str] | None = None,
+    training_image_paths: Sequence[str] | None = None,
     raw_image_paths: Sequence[str] | None = None,
     raw_bbox_paths: Sequence[str] | None = None,
     raw_camera_params_paths: Sequence[str] | None = None,
@@ -1274,6 +1275,7 @@ def build_schema_v2_record(
         raise ValueError("schema-v2 records require exactly four camera observations")
     path_fields = {
         "image_paths": image_paths,
+        "training_image_paths": training_image_paths,
         "raw_image_paths": raw_image_paths,
         "raw_bbox_paths": raw_bbox_paths,
         "raw_camera_params_paths": raw_camera_params_paths,
@@ -1308,6 +1310,10 @@ def build_schema_v2_record(
         observation_dict = observation.as_dict()
         if image_paths is not None:
             observation_dict["image_path"] = str(image_paths[observation_index])
+        if training_image_paths is not None:
+            observation_dict["training_image_path"] = str(
+                training_image_paths[observation_index]
+            )
         if raw_image_paths is not None:
             observation_dict["raw_image_path"] = str(raw_image_paths[observation_index])
         if raw_bbox_paths is not None:

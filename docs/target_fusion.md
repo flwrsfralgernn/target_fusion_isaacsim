@@ -29,20 +29,34 @@ Each synchronized camera view is also saved as an annotated PNG under
 `--image-output-dir PATH`; the corresponding path is recorded in each schema-v2
 camera observation.
 
+An unannotated copy after resolution, photometric, and RGB pixel noise is saved
+under `outputs/target_fusion_bbox_v2_images/training/` and recorded as
+`training_image_path`. The YOLO exporter prefers this processed image and falls
+back to the clean `raw_image_path` for captures created by older versions.
+
 The same synchronized step is attached to an Isaac Replicator `BasicWriter`.
 Clean RGB frames and Isaac-native tight bbox artifacts are written under
 `outputs/sdg_raw/` by default. Override that location with
 `--raw-output-dir PATH`. Pass `--sensor-noise` to add independent Gaussian noise
 to the requested mannequin X/Y/Z position. The default standard deviation is
-`0.02 0.02 0.02` metres and can be changed with
+`0.01 0.01 0.01` metres and can be changed with
 `--position-noise-std STD_X STD_Y STD_Z`. Sampling is reproducible from `--seed`;
 the nominal position, sampled offset, and applied position are recorded in each capture.
 The same flag applies per-camera resolution noise: a scale is drawn from
-`N(1.0, 0.15)`, clamped to `0.5-1.5`, and used as an intermediate resampling
+`N(1.0, 0.10)`, clamped to `0.75-1.25`, and used as an intermediate resampling
 resolution before returning the frame to its configured dimensions. This preserves
 bbox/intrinsic geometry while modeling downscaling and upscaling artifacts. Change
 the scale standard deviation with `--resolution-noise-std FLOAT`; sampled scales and
 intermediate resolutions are included in capture metadata.
+Per-camera photometric augmentation is also enabled by `--sensor-noise`. It samples
+an additive normalized brightness offset (`sigma=0.025`), exposure in photographic
+stops (`sigma=0.15`), and color temperature around D65/6500 K (`sigma=300 K`). Use
+`--brightness-noise-std FLOAT`, `--exposure-noise-std STOPS`, and
+`--color-temperature-noise-std KELVIN` to tune them. Sampled values, exposure
+multipliers, and RGB white-balance gains are stored in capture metadata.
+Independent Gaussian RGB pixel noise is then applied per pixel and channel with
+an 8-bit standard deviation of 5.0. Alpha is preserved, output is clipped to
+`[0, 255]`, and `--rgb-pixel-noise-std PIXEL_VALUE` controls the strength.
 Use `--frames N` to generate exactly `N` captures;
 backgrounds repeat in stable filename order when `N` exceeds the number of
 available PNGs.

@@ -416,6 +416,7 @@ class TargetFusionMathTests(unittest.TestCase):
             fusion_evaluation=evaluation,
             settled=True,
             image_paths=[f"annotated_{index}.png" for index in range(4)],
+            training_image_paths=[f"training_{index}.png" for index in range(4)],
             raw_image_paths=[f"raw_rgb_{index}.png" for index in range(4)],
             raw_bbox_paths=[f"raw_bbox_{index}.npy" for index in range(4)],
             raw_camera_params_paths=[f"camera_params_{index}.json" for index in range(4)],
@@ -427,6 +428,10 @@ class TargetFusionMathTests(unittest.TestCase):
         self.assertEqual(decoded["capture"]["valid_camera_count"], 4)
         self.assertIsNone(decoded["inferred_rays"][0]["ray"]["target_distance_m"])
         self.assertEqual(decoded["camera_observations"][0]["image_path"], "annotated_0.png")
+        self.assertEqual(
+            decoded["camera_observations"][0]["training_image_path"],
+            "training_0.png",
+        )
         self.assertEqual(decoded["camera_observations"][0]["raw_image_path"], "raw_rgb_0.png")
         self.assertEqual(decoded["camera_observations"][0]["raw_bbox_path"], "raw_bbox_0.npy")
         self.assertEqual(

@@ -34,6 +34,16 @@ From the repository root:
   --headless
 ```
 
+To run the complete 2,000-episode workflow—capture, export, validation,
+preview generation, and YOLO training—with the tuned sensor-noise defaults:
+
+```bash
+./scripts/run_full_pipeline.sh
+```
+
+The wrapper uses `/home/rog/Downloads/isaacsim/python.sh` by default. Set
+`ISAAC_SIM_PYTHON` before running it if Isaac Sim is installed elsewhere.
+
 For a GUI run, omit `--headless`. The default configuration is:
 
 - four fixed cameras: `/World/Camera_01` through `/World/Camera_04`
@@ -52,6 +62,10 @@ complete CLI. Common options are:
 --sensor-noise
 --position-noise-std STD_X STD_Y STD_Z
 --resolution-noise-std FLOAT
+--brightness-noise-std FLOAT
+--exposure-noise-std STOPS
+--color-temperature-noise-std KELVIN
+--rgb-pixel-noise-std PIXEL_VALUE
 --seed N
 --pose-mode {random,fixed,scenario}
 --pose-position X Y Z
@@ -81,12 +95,18 @@ Each background cycle follows this sequence:
 2. Select the mannequin pose (random, fixed, or scenario) and apply the chosen settling mode.
 3. Capture synchronized RGB and `bounding_box_2d_tight` views from all four cameras. Use
    `--sensor-noise` to add independent, seeded Gaussian noise to the requested mannequin
-   position. The default XYZ standard deviation is 2 cm; override it with
+   position. The default XYZ standard deviation is 1 cm; override it with
    `--position-noise-std STD_X STD_Y STD_Z` (metres). It also samples a per-camera
-   resolution scale from a Gaussian centered at 1.0 with standard deviation 0.15,
-   clamped to 0.5-1.5. Each frame is resized through the sampled resolution and back
+   resolution scale from a Gaussian centered at 1.0 with standard deviation 0.10,
+   clamped to 0.75-1.25. Each frame is resized through the sampled resolution and back
    to its configured size so bounding boxes and calibration remain aligned. Override
-   the scale spread with `--resolution-noise-std FLOAT`.
+   the scale spread with `--resolution-noise-std FLOAT`. Per-camera photometric noise
+   adds brightness offsets (`sigma=0.025`), exposure changes (`sigma=0.15` stops), and
+   color-temperature changes around 6500 K (`sigma=300 K`). Configure these with
+   `--brightness-noise-std`, `--exposure-noise-std`, and
+   `--color-temperature-noise-std`. Finally, independent Gaussian noise is added
+   to every RGB channel with an 8-bit standard deviation of 5 by default; tune it
+   with `--rgb-pixel-noise-std PIXEL_VALUE`.
 4. Resolve semantic IDs, validate boxes, compute floating-point box centers, and fire bearing rays from every camera that sees the mannequin. Cameras that miss it remain in the capture with an invalid observation.
 5. Pause the timeline, fuse the rays, and display the valid estimate.
 6. Save annotated camera images and JSONL diagnostics.
@@ -204,7 +224,9 @@ Valid images contain the mannequin bbox and center coordinates. Invalid images
 contain the rejection reason. Image paths are recorded in the corresponding
 schema-v2 camera observation.
 
-`outputs/sdg_raw/` contains clean Isaac BasicWriter RGB frames, tight bbox
+`outputs/target_fusion_bbox_v2_images/training/` contains unannotated frames
+after resolution, photometric, and RGB pixel noise. The YOLO exporter prefers
+these training frames. `outputs/sdg_raw/` contains clean Isaac BasicWriter RGB frames, tight bbox
 arrays, camera parameters, and `manifest.jsonl`. These raw images remain
 separate from annotated diagnostic previews.
 
@@ -220,7 +242,9 @@ python3 scripts/export_yolo_dataset.py \
 The exporter writes `data.yaml`, `train/`, `val/`, and `test/` directories with
 normalized YOLO labels. Empty camera views receive empty label files. Clipped
 boxes are clamped and retained when they have positive visible area. All four
-camera views from one capture are assigned to the same split.
+camera views from one capture are assigned to the same split. It uses each
+observation's noise-processed `training_image_path`, falling back to the clean
+`raw_image_path` for older captures.
 
 Validate and preview the exported dataset:
 
