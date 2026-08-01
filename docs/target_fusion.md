@@ -32,7 +32,18 @@ camera observation.
 The same synchronized step is attached to an Isaac Replicator `BasicWriter`.
 Clean RGB frames and Isaac-native tight bbox artifacts are written under
 `outputs/sdg_raw/` by default. Override that location with
-`--raw-output-dir PATH`. Use `--frames N` to generate exactly `N` captures;
+`--raw-output-dir PATH`. Pass `--sensor-noise` to add independent Gaussian noise
+to the requested mannequin X/Y/Z position. The default standard deviation is
+`0.02 0.02 0.02` metres and can be changed with
+`--position-noise-std STD_X STD_Y STD_Z`. Sampling is reproducible from `--seed`;
+the nominal position, sampled offset, and applied position are recorded in each capture.
+The same flag applies per-camera resolution noise: a scale is drawn from
+`N(1.0, 0.15)`, clamped to `0.5-1.5`, and used as an intermediate resampling
+resolution before returning the frame to its configured dimensions. This preserves
+bbox/intrinsic geometry while modeling downscaling and upscaling artifacts. Change
+the scale standard deviation with `--resolution-noise-std FLOAT`; sampled scales and
+intermediate resolutions are included in capture metadata.
+Use `--frames N` to generate exactly `N` captures;
 backgrounds repeat in stable filename order when `N` exceeds the number of
 available PNGs.
 

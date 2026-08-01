@@ -49,6 +49,9 @@ complete CLI. Common options are:
 ```text
 --resolution WIDTH HEIGHT
 --rt-subframes N
+--sensor-noise
+--position-noise-std STD_X STD_Y STD_Z
+--resolution-noise-std FLOAT
 --seed N
 --pose-mode {random,fixed,scenario}
 --pose-position X Y Z
@@ -76,7 +79,14 @@ Each background cycle follows this sequence:
 
 1. Randomize the background material.
 2. Select the mannequin pose (random, fixed, or scenario) and apply the chosen settling mode.
-3. Capture synchronized RGB and `bounding_box_2d_tight` views from all four cameras.
+3. Capture synchronized RGB and `bounding_box_2d_tight` views from all four cameras. Use
+   `--sensor-noise` to add independent, seeded Gaussian noise to the requested mannequin
+   position. The default XYZ standard deviation is 2 cm; override it with
+   `--position-noise-std STD_X STD_Y STD_Z` (metres). It also samples a per-camera
+   resolution scale from a Gaussian centered at 1.0 with standard deviation 0.15,
+   clamped to 0.5-1.5. Each frame is resized through the sampled resolution and back
+   to its configured size so bounding boxes and calibration remain aligned. Override
+   the scale spread with `--resolution-noise-std FLOAT`.
 4. Resolve semantic IDs, validate boxes, compute floating-point box centers, and fire bearing rays from every camera that sees the mannequin. Cameras that miss it remain in the capture with an invalid observation.
 5. Pause the timeline, fuse the rays, and display the valid estimate.
 6. Save annotated camera images and JSONL diagnostics.

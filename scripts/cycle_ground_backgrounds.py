@@ -48,6 +48,12 @@ MATERIAL_PATH = "/World/Looks/BackgroundSwapMaterial"
 MANNEQUIN_Z_OFFSET = 0.5
 SETTLE_SPEED_THRESHOLD = 0.02
 SETTLE_STABLE_SECONDS = 0.5
+DEFAULT_POSITION_NOISE_STD_M = (0.02, 0.02, 0.02)
+POSITION_NOISE_SEED_SALT = 0x504F534E
+DEFAULT_RESOLUTION_NOISE_STD = 0.15
+MIN_RESOLUTION_NOISE_SCALE = 0.5
+MAX_RESOLUTION_NOISE_SCALE = 1.5
+RESOLUTION_NOISE_SEED_SALT = 0x5245534E
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,6 +111,34 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Replicator render subframes per synchronized capture (default: 1)",
+    )
+    parser.add_argument(
+        "--sensor-noise",
+        action="store_true",
+        help=(
+            "Add reproducible Gaussian noise to each requested world position "
+            "(default: disabled)"
+        ),
+    )
+    parser.add_argument(
+        "--position-noise-std",
+        type=float,
+        nargs=3,
+        default=DEFAULT_POSITION_NOISE_STD_M,
+        metavar=("STD_X", "STD_Y", "STD_Z"),
+        help=(
+            "Gaussian position-noise standard deviations in metres for X Y Z; "
+            "used with --sensor-noise (default: 0.02 0.02 0.02)"
+        ),
+    )
+    parser.add_argument(
+        "--resolution-noise-std",
+        type=float,
+        default=DEFAULT_RESOLUTION_NOISE_STD,
+        help=(
+            "Standard deviation of the Gaussian image-resolution scale around 1.0; "
+            "used with --sensor-noise and clamped to 0.5-1.5 (default: 0.15)"
+        ),
     )
     parser.add_argument(
         "--target-label",
@@ -328,6 +362,89 @@ def _coerce_pose_position(value, *, name: str = "pose position") -> tuple[float,
     if not np.all(np.isfinite(position)):
         raise ValueError(f"{name} must contain only finite values")
     return tuple(float(component) for component in position)
+
+
+def _coerce_position_noise_std(value) -> tuple[float, float, float]:
+    """Validate Gaussian position-noise standard deviations in metres."""
+    standard_deviation = np.asarray(value, dtype=np.float64)
+    if standard_deviation.shape != (3,):
+        raise ValueError("--position-noise-std must contain exactly three values")
+    if not np.all(np.isfinite(standard_deviation)):
+        raise ValueError("--position-noise-std must contain only finite values")
+    if np.any(standard_deviation < 0.0):
+        raise ValueError("--position-noise-std values must be nonnegative")
+    return tuple(float(component) for component in standard_deviation)
+
+
+def _coerce_resolution_noise_std(value) -> float:
+    """Validate the Gaussian image-resolution scale standard deviation."""
+    standard_deviation = float(value)
+    if not math.isfinite(standard_deviation):
+        raise ValueError("--resolution-noise-std must be finite")
+    if standard_deviation < 0.0:
+        raise ValueError("--resolution-noise-std must be nonnegative")
+    return standard_deviation
+
+
+def add_gaussian_position_noise(
+    position,
+    standard_deviation,
+    randomizer: random.Random,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a position and XYZ offset sampled from independent Gaussians."""
+    nominal_position = np.asarray(
+        _coerce_pose_position(position, name="nominal position"),
+        dtype=np.float64,
+    )
+    std = _coerce_position_noise_std(standard_deviation)
+    offset = np.asarray(
+        [randomizer.gauss(0.0, axis_std) for axis_std in std],
+        dtype=np.float64,
+    )
+    return nominal_position + offset, offset
+
+
+def apply_gaussian_resolution_noise(
+    rgb_data,
+    standard_deviation: float,
+    randomizer: random.Random,
+) -> tuple[np.ndarray, float, tuple[int, int]]:
+    """Resample an RGB frame through a Gaussian-scaled intermediate resolution.
+
+    The returned frame retains its original dimensions, so existing bounding
+    boxes and camera calibration remain valid. The intermediate resize models
+    both resolution loss and resolution upscaling without changing geometry.
+    """
+    from PIL import Image
+
+    image_array = np.asarray(rgb_data)
+    if image_array.ndim != 3 or image_array.shape[2] not in (3, 4):
+        raise ValueError(f"RGB frame must have 3 or 4 channels, got shape {image_array.shape}")
+    if not np.all(np.isfinite(image_array)):
+        raise ValueError("RGB frame must contain only finite pixels")
+    if np.issubdtype(image_array.dtype, np.floating):
+        scale_to_byte = 255.0 if float(np.max(image_array)) <= 1.0 else 1.0
+        image_array = np.clip(image_array * scale_to_byte, 0.0, 255.0).astype(np.uint8)
+    elif image_array.dtype != np.uint8:
+        image_array = np.clip(image_array, 0, 255).astype(np.uint8)
+
+    std = _coerce_resolution_noise_std(standard_deviation)
+    sampled_scale = min(
+        MAX_RESOLUTION_NOISE_SCALE,
+        max(MIN_RESOLUTION_NOISE_SCALE, randomizer.gauss(1.0, std)),
+    )
+    height, width = image_array.shape[:2]
+    intermediate_resolution = (
+        max(1, int(round(width * sampled_scale))),
+        max(1, int(round(height * sampled_scale))),
+    )
+    if intermediate_resolution == (width, height):
+        return image_array.copy(), float(sampled_scale), intermediate_resolution
+
+    image = Image.fromarray(image_array)
+    image = image.resize(intermediate_resolution, resample=Image.Resampling.LANCZOS)
+    image = image.resize((width, height), resample=Image.Resampling.LANCZOS)
+    return np.asarray(image), float(sampled_scale), intermediate_resolution
 
 
 def _coerce_pose_orientation(
@@ -840,6 +957,8 @@ def main() -> None:
     validate_yolo_options(args)
     validate_yolo_runtime(args.yolo_comparison_mode)
     validate_pose_options(args)
+    position_noise_std = _coerce_position_noise_std(args.position_noise_std)
+    resolution_noise_std = _coerce_resolution_noise_std(args.resolution_noise_std)
     if args.settle_timeout <= 0:
         raise ValueError("--settle-timeout must be greater than zero")
     if args.scene_hold_seconds < 0:
@@ -1001,6 +1120,8 @@ def main() -> None:
         ground_center = (ground_min + ground_max) * 0.5
         ground_half_extent = (ground_max - ground_min) * 0.25
         randomizer = random.Random(args.seed)
+        position_noise_randomizer = random.Random(args.seed ^ POSITION_NOISE_SEED_SALT)
+        resolution_noise_randomizer = random.Random(args.seed ^ RESOLUTION_NOISE_SEED_SALT)
 
         # Establish fixed camera poses once. The target height comes from the
         # authored mannequin bounds plus the constant scene translation; the
@@ -1058,6 +1179,15 @@ def main() -> None:
         print(f"Loaded stage: {world_path}")
         print(f"Found {len(backgrounds)} PNG background(s) in {args.backgrounds_dir.resolve()}")
         print(f"Validated camera prim(s): {', '.join(args.camera_prims)}")
+        print(
+            f"Gaussian position noise: {'enabled' if args.sensor_noise else 'disabled'} "
+            f"std_m={position_noise_std}"
+        )
+        print(
+            f"Gaussian resolution noise: {'enabled' if args.sensor_noise else 'disabled'} "
+            f"scale_std={resolution_noise_std} "
+            f"limits=({MIN_RESOLUTION_NOISE_SCALE}, {MAX_RESOLUTION_NOISE_SCALE})"
+        )
         schema_v2_output_path = args.schema_v2_output.expanduser().resolve()
         if schema_v2_output_path == world_path or schema_v2_output_path in backgrounds:
             raise ValueError(
@@ -1138,6 +1268,16 @@ def main() -> None:
                 requested_orientation_wxyz = _xyzw_to_wxyz(requested_orientation_xyzw)
                 pose_name = pose_scenario["name"]
 
+            nominal_position = requested_position.copy()
+            if args.sensor_noise:
+                requested_position, position_noise_offset = add_gaussian_position_noise(
+                    nominal_position,
+                    position_noise_std,
+                    position_noise_randomizer,
+                )
+            else:
+                position_noise_offset = np.zeros(3, dtype=np.float64)
+
             mannequin.set_world_poses(
                 positions=[requested_position],
                 orientations=[requested_orientation_wxyz],
@@ -1152,6 +1292,12 @@ def main() -> None:
                 + (f" scenario={pose_name!r}" if pose_name is not None else "")
                 + f" requested=({requested_position[0]:.3f}, "
                 f"{requested_position[1]:.3f}, {requested_position[2]:.3f})"
+                + (
+                    f" gaussian_offset=({position_noise_offset[0]:+.3f}, "
+                    f"{position_noise_offset[1]:+.3f}, {position_noise_offset[2]:+.3f})"
+                    if args.sensor_noise
+                    else ""
+                )
             )
             simulation_app.update()  # Flush material and pose edits before playing.
             if args.settle_mode == "physics":
@@ -1178,7 +1324,9 @@ def main() -> None:
             pose_metadata = {
                 "mode": args.pose_mode,
                 "scenario_name": pose_name,
+                "nominal_position_world": nominal_position.tolist(),
                 "requested_position_world": requested_position.tolist(),
+                "position_noise_world": position_noise_offset.tolist(),
                 "requested_orientation_xyzw": requested_orientation_xyzw.tolist(),
                 "settled_position_world": settled_position.tolist(),
                 "settled_orientation_xyzw": settled_orientation_xyzw.tolist(),
@@ -1220,6 +1368,35 @@ def main() -> None:
                 raise RuntimeError(
                     "RGB annotator count does not match bbox annotator count for synchronized capture"
                 )
+            resolution_noise_samples = []
+            if args.sensor_noise:
+                noisy_rgb_frames = []
+                for camera_path, rgb_frame in zip(args.camera_prims, rgb_frames):
+                    noisy_frame, sampled_scale, intermediate_resolution = (
+                        apply_gaussian_resolution_noise(
+                            rgb_frame,
+                            resolution_noise_std,
+                            resolution_noise_randomizer,
+                        )
+                    )
+                    noisy_rgb_frames.append(noisy_frame)
+                    resolution_noise_samples.append(
+                        {
+                            "camera_path": camera_path,
+                            "sampled_scale_factor": sampled_scale,
+                            "intermediate_resolution": list(intermediate_resolution),
+                        }
+                    )
+                rgb_frames = noisy_rgb_frames
+            else:
+                resolution_noise_samples = [
+                    {
+                        "camera_path": camera_path,
+                        "sampled_scale_factor": 1.0,
+                        "intermediate_resolution": list(render_resolution),
+                    }
+                    for camera_path in args.camera_prims
+                ]
             yolo_inference_results = None
             if args.yolo_comparison_mode == "same-time":
                 yolo_inference_results = infer_yolo_frames(
@@ -1434,6 +1611,21 @@ def main() -> None:
                 raw_camera_params_paths=raw_camera_params_paths,
             )
             schema_v2_record["capture"]["pose"] = pose_metadata
+            schema_v2_record["capture"]["sensor_noise_enabled"] = bool(args.sensor_noise)
+            schema_v2_record["capture"]["sensor_noise"] = {
+                "enabled": bool(args.sensor_noise),
+                "position_distribution": "gaussian",
+                "position_standard_deviation_m": list(position_noise_std),
+                "sampled_position_offset_m": position_noise_offset.tolist(),
+                "resolution_scale_distribution": "gaussian",
+                "resolution_scale_mean": 1.0,
+                "resolution_scale_standard_deviation": resolution_noise_std,
+                "resolution_scale_limits": [
+                    MIN_RESOLUTION_NOISE_SCALE,
+                    MAX_RESOLUTION_NOISE_SCALE,
+                ],
+                "resolution_samples": resolution_noise_samples,
+            }
             if fusion_comparison is not None:
                 attach_yolo_comparison_record(
                     schema_v2_record,
@@ -1455,6 +1647,21 @@ def main() -> None:
                 "target_label": args.target_label,
                 "resolution": list(render_resolution),
                 "rt_subframes": args.rt_subframes,
+                "sensor_noise_enabled": bool(args.sensor_noise),
+                "sensor_noise": {
+                    "enabled": bool(args.sensor_noise),
+                    "position_distribution": "gaussian",
+                    "position_standard_deviation_m": list(position_noise_std),
+                    "sampled_position_offset_m": position_noise_offset.tolist(),
+                    "resolution_scale_distribution": "gaussian",
+                    "resolution_scale_mean": 1.0,
+                    "resolution_scale_standard_deviation": resolution_noise_std,
+                    "resolution_scale_limits": [
+                        MIN_RESOLUTION_NOISE_SCALE,
+                        MAX_RESOLUTION_NOISE_SCALE,
+                    ],
+                    "resolution_samples": resolution_noise_samples,
+                },
                 "settled": bool(settled),
                 "pose": pose_metadata,
                 "cameras": [
