@@ -574,6 +574,7 @@ def main() -> None:
             build_schema_v2_record,
             clear_debug_draw,
             compute_world_target_center,
+            DEFAULT_GROUND_TRUTH_RAY_COLOR,
             draw_fused_rays,
             evaluate_fusion,
             fuse_rays,
@@ -853,6 +854,7 @@ def main() -> None:
                 draw_fused_rays(
                     rays,
                     fusion_result.fused_position_world,
+                    camera_colors=(DEFAULT_GROUND_TRUTH_RAY_COLOR,),
                     truth_world=target_world,
                 )
 

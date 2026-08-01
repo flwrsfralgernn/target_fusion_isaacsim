@@ -23,6 +23,7 @@ DEFAULT_CAMERA_COLORS = (
     (1.0, 0.8, 0.1, 1.0),
     (0.7, 0.3, 1.0, 1.0),
 )
+DEFAULT_GROUND_TRUTH_RAY_COLOR = (0.0, 1.0, 0.0, 1.0)
 DEFAULT_TARGET_COLOR = (0.1, 1.0, 0.2, 1.0)
 DEFAULT_TRUTH_EVALUATION_COLOR = (1.0, 0.1, 0.1, 1.0)
 
@@ -845,7 +846,7 @@ def draw_ground_truth_rays(
     clear_existing: bool = True,
     line_thickness: float = 3.0,
     target_size: float = 12.0,
-    camera_colors: Sequence[tuple[float, float, float, float]] = DEFAULT_CAMERA_COLORS,
+    ray_color: tuple[float, float, float, float] = DEFAULT_GROUND_TRUTH_RAY_COLOR,
     target_color: tuple[float, float, float, float] = DEFAULT_TARGET_COLOR,
 ) -> dict:
     """Draw exact camera-to-target rays and a target marker in the viewport.
@@ -859,9 +860,6 @@ def draw_ground_truth_rays(
         raise ValueError("line_thickness must be finite and positive")
     if not isfinite(target_size) or target_size <= 0.0:
         raise ValueError("target_size must be finite and positive")
-    if not camera_colors:
-        raise ValueError("camera_colors must contain at least one RGBA color")
-
     target = _coerce_vector3(target_world, name="target_world")
     from isaacsim.util.debug_draw import _debug_draw
 
@@ -872,7 +870,7 @@ def draw_ground_truth_rays(
 
     start_points = [ray.origin_world.tolist() for ray in rays]
     end_points = [target.tolist() for _ in rays]
-    colors = [list(camera_colors[index % len(camera_colors)]) for index in range(len(rays))]
+    colors = [list(ray_color) for _ in rays]
     thicknesses = [line_thickness] * len(rays)
     draw_interface.draw_lines(start_points, end_points, colors, thicknesses)
     draw_interface.draw_points([target.tolist()], [list(target_color)], [target_size])
@@ -880,6 +878,7 @@ def draw_ground_truth_rays(
         "ray_count": len(rays),
         "target_world": target,
         "camera_colors": colors,
+        "ray_color": list(ray_color),
     }
 
 
