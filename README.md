@@ -117,6 +117,30 @@ capture Isaac data:
 python3 -B -m unittest discover -s tests -v
 ```
 
+## Train YOLO locally
+
+The attached Colab workflow is available as a GPU-first local script. It
+audits the pre-split normal-bbox dataset, writes a local-path YAML, and then
+trains YOLO11. It stops rather than silently falling back to CPU when CUDA is
+not available:
+
+```bash
+python3 scripts/train_yolo_local.py \
+  --data outputs/autovalidated_sdg_final/yolo/data.yaml
+```
+
+Run the audit without starting training:
+
+```bash
+python3 scripts/train_yolo_local.py \
+  --data outputs/autovalidated_sdg_final/yolo/data.yaml \
+  --check-only
+```
+
+Useful options include `--model yolo11s.pt`, `--batch 16`, `--cache disk`,
+`--resume PATH/last.pt`, `--eval-test`, and `--archive`. Training outputs are
+kept under `outputs/yolo_training_runs/` and ignored by Git.
+
 The existing exact-coordinate baseline at
 `outputs/target_fusion_ground_truth.jsonl` is preserved by default. To also
 write a schema-v1 compatibility record, explicitly provide:

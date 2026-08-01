@@ -1,2 +1,6 @@
 # Generated Isaac Sim SDG captures and YOLO exports.
 outputs/autovalidated_sdg*/
+
+# Local YOLO training runs and optional archives.
+outputs/yolo_training_runs/
+outputs/yolo_training_archives/
