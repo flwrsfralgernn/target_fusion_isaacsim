@@ -34,6 +34,51 @@ the mannequin pose and settle it, fire the synchronized four-camera capture,
 pause the timeline for inspection, then clear all transient rays and markers
 before the next cycle.
 
+## Compare a local YOLO model
+
+YOLO is disabled unless both a model and comparison mode are selected. For
+example, compare a locally trained checkpoint using the same synchronized RGB
+capture as the ground truth:
+
+```bash
+/home/rog/Downloads/isaacsim/python.sh scripts/cycle_ground_backgrounds.py \
+  --yolo-model outputs/yolo_training_runs/mannequin_yolo11n_bbox/weights/best.pt \
+  --yolo-comparison-mode same-time \
+  --headless
+```
+
+The available modes are `after-ground-truth` and `same-time`. Both produce
+per-camera YOLO detections, rays, fusion, and comparison metrics in the
+schema-v2 record. The former performs YOLO after ground-truth fusion; the
+latter runs both computations from the same synchronized RGB frames. In GUI
+mode, ground-truth rays are green and YOLO rays are blue.
+
+`yolo11n.pt` and `yolo26n.pt` are supported aliases for checkpoints at the
+repository root. Any explicit local `.pt` path is also accepted; the model
+must be an Ultralytics detection checkpoint containing the configured target
+label, normally `mannequin`. Additional tuning options are
+`--yolo-confidence-threshold`, `--yolo-iou-threshold`, `--yolo-image-size`,
+and `--yolo-device`.
+
+Live YOLO capture requires `ultralytics` in the Python environment used by
+Isaac Sim. The standalone Isaac Sim 6.0 package already bundles PyTorch
+`2.11.0+cu128`; it becomes available after `SimulationApp` starts. Install
+Ultralytics without dependencies so pip does not download a second Torch copy:
+
+```bash
+/home/rog/Downloads/isaacsim/python.sh -m pip install \
+  --no-deps --no-cache-dir "ultralytics==8.4.80"
+```
+
+Verify the environment with the same launcher used for capture, for example:
+
+```bash
+/home/rog/Downloads/isaacsim/python.sh -c \
+  "from isaacsim import SimulationApp; app=SimulationApp({'headless': True}); import torch, ultralytics; print(torch.__version__, ultralytics.__version__); app.close()"
+```
+
+Do not add packages from a different system Python's `site-packages` directory.
+
 The previous exact-coordinate schema-v1 file is not overwritten by default.
 Pass `--fusion-output PATH` only when a compatibility schema-v1 record is also
 needed. Summarize either format with:
@@ -41,6 +86,10 @@ needed. Summarize either format with:
 ```bash
 python3 scripts/report_target_fusion.py outputs/target_fusion_bbox_v2.jsonl
 ```
+
+If the JSONL contains YOLO comparison blocks, the report also includes model
+and mode coverage, detection rate, inference latency, confidence, bbox IoU,
+center/ray errors, fused-position deltas, YOLO target error, and miss reasons.
 
 The raw SDG directory keeps training images separate from visual diagnostics:
 

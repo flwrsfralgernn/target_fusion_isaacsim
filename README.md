@@ -42,6 +42,12 @@ Useful options:
 --raw-output-dir PATH
 --frames N
 --scene-hold-seconds SECONDS
+--yolo-model PATH_OR_ALIAS
+--yolo-comparison-mode {disabled,after-ground-truth,same-time}
+--yolo-confidence-threshold FLOAT
+--yolo-iou-threshold FLOAT
+--yolo-image-size PIXELS
+--yolo-device DEVICE
 ```
 
 ## Capture lifecycle
@@ -55,6 +61,44 @@ Each background cycle follows this sequence:
 5. Pause the timeline, fuse the rays, and display the valid estimate.
 6. Save annotated camera images and JSONL diagnostics.
 7. Clear all transient rays and markers before the next cycle.
+
+YOLO comparison is disabled by default. To compare a local detector against
+the same synchronized RGB frames, select a checkpoint and a timing mode:
+
+```bash
+/home/rog/Downloads/isaacsim/python.sh \
+  scripts/cycle_ground_backgrounds.py \
+  --yolo-model outputs/yolo_training_runs/mannequin_yolo11n_bbox/weights/best.pt \
+  --yolo-comparison-mode same-time \
+  --headless
+```
+
+The supported aliases `yolo11n.pt` and `yolo26n.pt` resolve from the repository
+root; explicit relative checkpoint paths resolve from the repository root as
+well. The checkpoint must be an Ultralytics detection model containing the
+selected `--target-label` (normally `mannequin`). `after-ground-truth` runs
+YOLO after the ground-truth fusion calculation, while `same-time` runs both
+from the same synchronized RGB capture. GUI comparison views draw ground-truth
+rays in green, YOLO rays in blue, and separate fused-position markers.
+
+Live YOLO capture requires `ultralytics` in Isaac Sim's own Python environment.
+The standalone Isaac Sim 6.0 package already bundles PyTorch
+`2.11.0+cu128`; it becomes available after `SimulationApp` starts. Install
+Ultralytics without dependencies so pip does not download a second Torch copy:
+
+```bash
+/home/rog/Downloads/isaacsim/python.sh -m pip install \
+  --no-deps --no-cache-dir "ultralytics==8.4.80"
+```
+
+Verify with the same launcher used for capture:
+
+```bash
+/home/rog/Downloads/isaacsim/python.sh -c \
+  "from isaacsim import SimulationApp; app=SimulationApp({'headless': True}); import torch, ultralytics; print(torch.__version__, ultralytics.__version__); app.close()"
+```
+
+Do not reuse a different system Python's `site-packages` directory.
 
 The four render products and annotators are created once. Capture uses one
 blocking `rep.orchestrator.step(..., pause_timeline=True, wait_for_render=True)`
@@ -169,6 +213,11 @@ Each JSONL record contains:
 Ground truth is never passed to ray construction or fusion. It is used only for
 camera setup validation and post-fusion evaluation.
 
+When YOLO comparison is enabled, each schema-v2 record additionally contains a
+`yolo` block with model metadata, one inference result per camera, the YOLO
+observations/rays/fusion, per-camera bbox/ray comparisons, and aggregate metrics
+such as IoU, center error, ray-angle error, and fused-position delta.
+
 ## Diagnostics report
 
 Summarize either schema-v1 or schema-v2 JSONL with:
@@ -181,6 +230,11 @@ python3 scripts/report_target_fusion.py \
 The report includes valid-capture rate, four-camera observation rate, position
 error distribution, RMS residual distribution, minimum ray-angle distribution,
 condition-number distribution, and invalid-fusion reasons.
+
+For captures made with YOLO comparison enabled, the same report automatically
+adds a `yolo` section with model/mode counts, detection and four-camera rates,
+inference latency, confidence, bbox IoU, center and ray-angle errors,
+fused-position deltas, YOLO position error, and miss/fusion reasons.
 
 A seeded eight-scene bbox capture previously produced:
 

@@ -24,6 +24,9 @@ DEFAULT_CAMERA_COLORS = (
     (0.7, 0.3, 1.0, 1.0),
 )
 DEFAULT_GROUND_TRUTH_RAY_COLOR = (0.0, 1.0, 0.0, 1.0)
+DEFAULT_YOLO_RAY_COLOR = (0.1, 0.4, 1.0, 1.0)
+DEFAULT_GROUND_TRUTH_FUSED_COLOR = (0.0, 0.8, 0.0, 1.0)
+DEFAULT_YOLO_FUSED_COLOR = (0.0, 0.2, 1.0, 1.0)
 DEFAULT_TARGET_COLOR = (0.1, 1.0, 0.2, 1.0)
 DEFAULT_TRUTH_EVALUATION_COLOR = (1.0, 0.1, 0.1, 1.0)
 
@@ -942,6 +945,127 @@ def draw_fused_rays(
         "closest_points_world": np.asarray(closest_points, dtype=np.float64),
         "truth_world": truth,
         "camera_colors": colors,
+    }
+
+
+def draw_comparison_rays(
+    ground_truth_rays: Sequence[CameraRay] | None = None,
+    yolo_rays: Sequence[CameraRay] | None = None,
+    *,
+    ground_truth_fused_position_world=None,
+    yolo_fused_position_world=None,
+    truth_world=None,
+    clear_existing: bool = True,
+    ray_length: float = 10.0,
+    line_thickness: float = 3.0,
+    point_size: float = 12.0,
+    ground_truth_ray_color: tuple[float, float, float, float] = DEFAULT_GROUND_TRUTH_RAY_COLOR,
+    yolo_ray_color: tuple[float, float, float, float] = DEFAULT_YOLO_RAY_COLOR,
+    ground_truth_fused_color: tuple[float, float, float, float] = DEFAULT_GROUND_TRUTH_FUSED_COLOR,
+    yolo_fused_color: tuple[float, float, float, float] = DEFAULT_YOLO_FUSED_COLOR,
+    truth_color: tuple[float, float, float, float] = DEFAULT_TRUTH_EVALUATION_COLOR,
+) -> dict:
+    """Draw ground-truth and YOLO rays with a shared display length.
+
+    The two ray sets are emitted from their camera origins to the same fixed
+    ``ray_length`` so their directions can be compared directly. Fused
+    positions and the exact world target are rendered as separate markers;
+    neither marker determines a ray endpoint.
+    """
+    ground_truth = [] if ground_truth_rays is None else list(ground_truth_rays)
+    yolo = [] if yolo_rays is None else list(yolo_rays)
+    for ray in [*ground_truth, *yolo]:
+        if not isinstance(ray, CameraRay):
+            raise TypeError("ground_truth_rays and yolo_rays must contain only CameraRay instances")
+    if not ground_truth and not yolo and all(
+        position is None
+        for position in (
+            ground_truth_fused_position_world,
+            yolo_fused_position_world,
+            truth_world,
+        )
+    ):
+        raise ValueError("at least one ray or marker position is required")
+    if not isfinite(ray_length) or ray_length <= 0.0:
+        raise ValueError("ray_length must be finite and positive")
+    if not isfinite(line_thickness) or line_thickness <= 0.0:
+        raise ValueError("line_thickness must be finite and positive")
+    if not isfinite(point_size) or point_size <= 0.0:
+        raise ValueError("point_size must be finite and positive")
+
+    ground_truth_endpoints = [ray.point_at(ray_length).tolist() for ray in ground_truth]
+    yolo_endpoints = [ray.point_at(ray_length).tolist() for ray in yolo]
+    ground_truth_fused = (
+        None
+        if ground_truth_fused_position_world is None
+        else _coerce_vector3(
+            ground_truth_fused_position_world,
+            name="ground_truth_fused_position_world",
+        )
+    )
+    yolo_fused = (
+        None
+        if yolo_fused_position_world is None
+        else _coerce_vector3(yolo_fused_position_world, name="yolo_fused_position_world")
+    )
+    truth = None if truth_world is None else _coerce_vector3(truth_world, name="truth_world")
+
+    from isaacsim.util.debug_draw import _debug_draw
+
+    draw_interface = _debug_draw.acquire_debug_draw_interface()
+    if clear_existing:
+        draw_interface.clear_lines()
+        draw_interface.clear_points()
+
+    if ground_truth:
+        draw_interface.draw_lines(
+            [ray.origin_world.tolist() for ray in ground_truth],
+            ground_truth_endpoints,
+            [list(ground_truth_ray_color)] * len(ground_truth),
+            [line_thickness] * len(ground_truth),
+        )
+    if yolo:
+        draw_interface.draw_lines(
+            [ray.origin_world.tolist() for ray in yolo],
+            yolo_endpoints,
+            [list(yolo_ray_color)] * len(yolo),
+            [line_thickness] * len(yolo),
+        )
+
+    point_positions = []
+    point_colors = []
+    point_sizes = []
+    if ground_truth_fused is not None:
+        point_positions.append(ground_truth_fused.tolist())
+        point_colors.append(list(ground_truth_fused_color))
+        point_sizes.append(point_size)
+    if yolo_fused is not None:
+        point_positions.append(yolo_fused.tolist())
+        point_colors.append(list(yolo_fused_color))
+        point_sizes.append(point_size)
+    if truth is not None:
+        point_positions.append(truth.tolist())
+        point_colors.append(list(truth_color))
+        point_sizes.append(point_size)
+    if point_positions:
+        draw_interface.draw_points(point_positions, point_colors, point_sizes)
+
+    def endpoint_array(points: list[list[float]]) -> np.ndarray:
+        return (
+            np.empty((0, 3), dtype=np.float64)
+            if not points
+            else np.asarray(points, dtype=np.float64)
+        )
+
+    return {
+        "ground_truth_ray_count": len(ground_truth),
+        "yolo_ray_count": len(yolo),
+        "ray_length": float(ray_length),
+        "ground_truth_endpoints_world": endpoint_array(ground_truth_endpoints),
+        "yolo_endpoints_world": endpoint_array(yolo_endpoints),
+        "ground_truth_fused_position_world": ground_truth_fused,
+        "yolo_fused_position_world": yolo_fused,
+        "truth_world": truth,
     }
 
 

@@ -12,6 +12,7 @@ source ``assets/world.usd`` is not overwritten.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import random
@@ -35,6 +36,7 @@ DEFAULT_FUSION_OUTPUT = PROJECT_DIR / "outputs" / "target_fusion_ground_truth.js
 DEFAULT_SCHEMA_V2_OUTPUT = PROJECT_DIR / "outputs" / "target_fusion_bbox_v2.jsonl"
 DEFAULT_IMAGE_OUTPUT_DIR = PROJECT_DIR / "outputs" / "target_fusion_bbox_v2_images"
 DEFAULT_RAW_OUTPUT_DIR = PROJECT_DIR / "outputs" / "sdg_raw"
+YOLO_COMPARISON_MODES = ("disabled", "after-ground-truth", "same-time")
 RAW_FRAME_PADDING = 6
 GROUND_PLANE_PATH = "/World/GroundPlane"
 GROUND_MESH_PATH = "/World/GroundPlane/CollisionMesh"
@@ -170,7 +172,113 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run without a GUI; useful for validation or later capture workflows",
     )
+    parser.add_argument(
+        "--yolo-model",
+        default=None,
+        help=(
+            "Local YOLO .pt checkpoint or supported alias (yolo11n.pt/yolo26n.pt); "
+            "required when --yolo-comparison-mode is enabled"
+        ),
+    )
+    parser.add_argument(
+        "--yolo-comparison-mode",
+        choices=YOLO_COMPARISON_MODES,
+        default="disabled",
+        help=(
+            "YOLO comparison timing: disabled keeps the ground-truth-only flow; "
+            "after-ground-truth runs YOLO after ground-truth fusion; same-time runs "
+            "both from the same synchronized RGB capture (default: disabled)"
+        ),
+    )
+    parser.add_argument(
+        "--yolo-confidence-threshold",
+        type=float,
+        default=0.25,
+        help="Minimum YOLO target confidence (default: 0.25)",
+    )
+    parser.add_argument(
+        "--yolo-iou-threshold",
+        type=float,
+        default=0.70,
+        help="YOLO NMS IoU threshold (default: 0.70)",
+    )
+    parser.add_argument(
+        "--yolo-image-size",
+        type=int,
+        default=640,
+        help="YOLO inference image size (default: 640)",
+    )
+    parser.add_argument(
+        "--yolo-device",
+        default=None,
+        help="Optional Ultralytics device selector, such as 0 or cpu (default: auto)",
+    )
     return parser.parse_args()
+
+
+def validate_yolo_options(args: argparse.Namespace) -> None:
+    """Validate the optional live-inference configuration before Isaac starts."""
+    mode = str(args.yolo_comparison_mode)
+    if mode not in YOLO_COMPARISON_MODES:
+        raise ValueError(
+            f"--yolo-comparison-mode must be one of {', '.join(YOLO_COMPARISON_MODES)}"
+        )
+    if mode == "disabled" and args.yolo_model is not None:
+        raise ValueError("--yolo-model requires --yolo-comparison-mode to be enabled")
+    if mode != "disabled" and args.yolo_model is None:
+        raise ValueError(
+            "--yolo-comparison-mode requires --yolo-model to select a local checkpoint"
+        )
+
+    confidence = float(args.yolo_confidence_threshold)
+    iou = float(args.yolo_iou_threshold)
+    image_size = int(args.yolo_image_size)
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        raise ValueError("--yolo-confidence-threshold must be finite and in [0, 1]")
+    if not math.isfinite(iou) or not 0.0 <= iou <= 1.0:
+        raise ValueError("--yolo-iou-threshold must be finite and in [0, 1]")
+    if image_size <= 0:
+        raise ValueError("--yolo-image-size must be positive")
+
+
+def validate_yolo_runtime(
+    comparison_mode: str,
+    *,
+    module_finder=None,
+) -> None:
+    """Fail early when the live YOLO runtime is unavailable.
+
+    Isaac Sim has its own Python environment.  Checking package discovery
+    before creating ``SimulationApp`` avoids an expensive startup followed by
+    an opaque import failure when the optional detector package is not
+    installed in that environment.  Torch is intentionally not checked here:
+    the standalone Isaac Sim 6.0 package exposes its bundled
+    ``2.11.0+cu128`` Torch only after ``SimulationApp`` initializes.
+
+    ``module_finder`` is injectable so this check can be unit-tested without
+    importing either Ultralytics or PyTorch.
+    """
+    if comparison_mode == "disabled":
+        return
+
+    if module_finder is None:
+        module_finder = importlib.util.find_spec
+
+    required_packages = ("ultralytics",)
+    missing_packages = [
+        package_name
+        for package_name in required_packages
+        if module_finder(package_name) is None
+    ]
+    if missing_packages:
+        missing = ", ".join(missing_packages)
+        raise RuntimeError(
+            "YOLO comparison requires the Isaac Sim Python environment to "
+            f"provide: {missing}. Install Ultralytics in that environment "
+            "without replacing Isaac Sim's bundled PyTorch, then verify with "
+            "the Isaac launcher before retrying. Do not reuse a different "
+            "system Python's site-packages."
+        )
 
 
 def find_backgrounds(backgrounds_dir: Path) -> list[Path]:
@@ -520,8 +628,42 @@ def build_camera_calibration(stage, camera_path: str, resolution):
     )
 
 
+def attach_yolo_comparison_record(
+    schema_record: dict,
+    *,
+    model_info,
+    comparison_mode: str,
+    inference_results,
+    comparison,
+) -> dict:
+    """Add JSON-compatible YOLO diagnostics to one schema-v2 record."""
+    if not isinstance(schema_record, dict):
+        raise TypeError("schema_record must be a dictionary")
+    if comparison_mode not in YOLO_COMPARISON_MODES[1:]:
+        raise ValueError("comparison_mode must be an enabled YOLO comparison mode")
+    if model_info is None or not callable(getattr(model_info, "as_dict", None)):
+        raise TypeError("model_info must provide as_dict()")
+    if not callable(getattr(comparison, "as_dict", None)):
+        raise TypeError("comparison must provide as_dict()")
+
+    serialized_results = []
+    for result in inference_results:
+        if not callable(getattr(result, "as_dict", None)):
+            raise TypeError("inference_results must provide as_dict()")
+        serialized_results.append(result.as_dict())
+    schema_record["yolo"] = {
+        "model": model_info.as_dict(),
+        "comparison_mode": comparison_mode,
+        "inference": serialized_results,
+        "comparison": comparison.as_dict(),
+    }
+    return schema_record
+
+
 def main() -> None:
     args = parse_args()
+    validate_yolo_options(args)
+    validate_yolo_runtime(args.yolo_comparison_mode)
     if args.settle_timeout <= 0:
         raise ValueError("--settle-timeout must be greater than zero")
     if args.scene_hold_seconds < 0:
@@ -552,6 +694,7 @@ def main() -> None:
     legacy_output = None
     raw_manifest_output = None
     writer = None
+    loaded_yolo_model = None
     render_products = []
     bbox_annotators = []
     rgb_annotators = []
@@ -568,18 +711,51 @@ def main() -> None:
         from target_fusion import (
             CameraObservation,
             FusionResult,
+            DEFAULT_GROUND_TRUTH_RAY_COLOR,
             aim_cameras_at_target,
             build_rays_from_available_observations,
             build_ground_truth_record,
             build_schema_v2_record,
             clear_debug_draw,
             compute_world_target_center,
-            DEFAULT_GROUND_TRUTH_RAY_COLOR,
+            draw_comparison_rays,
             draw_fused_rays,
             evaluate_fusion,
             fuse_rays,
             get_camera_world_pose,
         )
+
+        if args.yolo_comparison_mode != "disabled":
+            try:
+                from yolo_inference import (
+                    ObservationFusion,
+                    build_yolo_observations,
+                    compare_observation_fusions,
+                    fuse_observations,
+                    infer_yolo_frames,
+                    load_yolo_model,
+                )
+            except ModuleNotFoundError:
+                from scripts.yolo_inference import (
+                    ObservationFusion,
+                    build_yolo_observations,
+                    compare_observation_fusions,
+                    fuse_observations,
+                    infer_yolo_frames,
+                    load_yolo_model,
+                )
+
+            loaded_yolo_model = load_yolo_model(
+                args.yolo_model,
+                target_label=args.target_label,
+                project_dir=PROJECT_DIR,
+                relative_to=PROJECT_DIR,
+            )
+            print(
+                f"Loaded YOLO model: {loaded_yolo_model.info.path} "
+                f"(class={loaded_yolo_model.info.target_label!r}, "
+                f"id={loaded_yolo_model.info.target_class_id})"
+            )
 
         stage_utils.open_stage(str(world_path))
         wait_for_stage(simulation_app, stage_utils)
@@ -786,6 +962,16 @@ def main() -> None:
                 raise RuntimeError(
                     "RGB annotator count does not match bbox annotator count for synchronized capture"
                 )
+            yolo_inference_results = None
+            if args.yolo_comparison_mode == "same-time":
+                yolo_inference_results = infer_yolo_frames(
+                    loaded_yolo_model,
+                    rgb_frames,
+                    confidence_threshold=args.yolo_confidence_threshold,
+                    iou_threshold=args.yolo_iou_threshold,
+                    image_size=args.yolo_image_size,
+                    device=args.yolo_device,
+                )
             image_paths = []
             for camera_index, (rgb_frame, bbox) in enumerate(zip(rgb_frames, target_bboxes)):
                 image_path = image_output_dir / (
@@ -849,14 +1035,65 @@ def main() -> None:
                 if observation.valid
             ]
             fusion_evaluation = evaluate_fusion(fusion_result, target_world)
-            simulation_app.update()  # Flush camera orientation edits before drawing.
-            if not args.headless and rays and fusion_result.valid:
-                draw_fused_rays(
-                    rays,
-                    fusion_result.fused_position_world,
-                    camera_colors=(DEFAULT_GROUND_TRUTH_RAY_COLOR,),
-                    truth_world=target_world,
+            yolo_observations = None
+            yolo_source_fusion = None
+            fusion_comparison = None
+            if args.yolo_comparison_mode == "after-ground-truth":
+                yolo_inference_results = infer_yolo_frames(
+                    loaded_yolo_model,
+                    rgb_frames,
+                    confidence_threshold=args.yolo_confidence_threshold,
+                    iou_threshold=args.yolo_iou_threshold,
+                    image_size=args.yolo_image_size,
+                    device=args.yolo_device,
                 )
+            if loaded_yolo_model is not None:
+                yolo_observations = build_yolo_observations(
+                    camera_calibrations,
+                    yolo_inference_results,
+                    capture_id=scene_index,
+                )
+                yolo_source_fusion = fuse_observations(
+                    yolo_observations,
+                    target_world=target_world,
+                )
+                ground_truth_source_fusion = ObservationFusion(
+                    observations=tuple(observations),
+                    rays=tuple(rays),
+                    fusion=fusion_result,
+                    evaluation=fusion_evaluation,
+                    valid_camera_count=valid_observation_count,
+                )
+                fusion_comparison = compare_observation_fusions(
+                    ground_truth_source_fusion,
+                    yolo_source_fusion,
+                    inference_results=yolo_inference_results,
+                )
+            simulation_app.update()  # Flush camera orientation edits before drawing.
+            if not args.headless:
+                if fusion_comparison is not None:
+                    draw_comparison_rays(
+                        ground_truth_rays=rays,
+                        yolo_rays=yolo_source_fusion.rays,
+                        ground_truth_fused_position_world=(
+                            fusion_result.fused_position_world
+                            if fusion_result.valid
+                            else None
+                        ),
+                        yolo_fused_position_world=(
+                            yolo_source_fusion.fusion.fused_position_world
+                            if yolo_source_fusion.fusion.valid
+                            else None
+                        ),
+                        truth_world=target_world,
+                    )
+                elif rays and fusion_result.valid:
+                    draw_fused_rays(
+                        rays,
+                        fusion_result.fused_position_world,
+                        camera_colors=(DEFAULT_GROUND_TRUTH_RAY_COLOR,),
+                        truth_world=target_world,
+                    )
 
             fusion_error = (
                 "n/a"
@@ -874,6 +1111,15 @@ def main() -> None:
                 f"valid={fusion_result.valid} error={fusion_error} residual={residual} "
                 f"bbox_valid={valid_observation_count}/{len(observations)}"
             )
+            if fusion_comparison is not None:
+                comparison_metrics = fusion_comparison.metrics()
+                print(
+                    f"[yolo] mode={args.yolo_comparison_mode} "
+                    f"valid={comparison_metrics['yolo_valid_camera_count']}/"
+                    f"{comparison_metrics['camera_count']} "
+                    f"mean_iou={comparison_metrics['mean_bbox_iou']!s} "
+                    f"fused_delta={comparison_metrics['fused_position_delta_m']!s}"
+                )
             schema_v2_record = build_schema_v2_record(
                 scene_index=scene_index,
                 capture_id=scene_index,
@@ -892,6 +1138,14 @@ def main() -> None:
                 raw_bbox_paths=raw_bbox_paths,
                 raw_camera_params_paths=raw_camera_params_paths,
             )
+            if fusion_comparison is not None:
+                attach_yolo_comparison_record(
+                    schema_v2_record,
+                    model_info=loaded_yolo_model.info,
+                    comparison_mode=args.yolo_comparison_mode,
+                    inference_results=yolo_inference_results,
+                    comparison=fusion_comparison,
+                )
             schema_v2_output.write(
                 json.dumps(schema_v2_record, separators=(",", ":"), allow_nan=False) + "\n"
             )
