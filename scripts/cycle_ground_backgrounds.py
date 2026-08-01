@@ -17,6 +17,7 @@ import json
 import math
 import random
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +38,8 @@ DEFAULT_SCHEMA_V2_OUTPUT = PROJECT_DIR / "outputs" / "target_fusion_bbox_v2.json
 DEFAULT_IMAGE_OUTPUT_DIR = PROJECT_DIR / "outputs" / "target_fusion_bbox_v2_images"
 DEFAULT_RAW_OUTPUT_DIR = PROJECT_DIR / "outputs" / "sdg_raw"
 YOLO_COMPARISON_MODES = ("disabled", "after-ground-truth", "same-time")
+POSE_MODES = ("random", "fixed", "scenario")
+SETTLE_MODES = ("physics", "none")
 YOLO_SEQUENTIAL_HOLD_SECONDS = 5.0
 RAW_FRAME_PADDING = 6
 GROUND_PLANE_PATH = "/World/GroundPlane"
@@ -126,6 +129,51 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Seed for reproducible mannequin placement (default: 0)",
+    )
+    parser.add_argument(
+        "--pose-mode",
+        choices=POSE_MODES,
+        default="random",
+        help=(
+            "Mannequin pose source: random preserves the existing seeded placement; "
+            "fixed uses --pose-position; scenario reads --pose-scenarios (default: random)"
+        ),
+    )
+    parser.add_argument(
+        "--pose-position",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help="Fixed world-space mannequin position; requires --pose-mode fixed",
+    )
+    parser.add_argument(
+        "--pose-orientation",
+        type=float,
+        nargs=4,
+        metavar=("QX", "QY", "QZ", "QW"),
+        default=None,
+        help=(
+            "Fixed world-space quaternion in XYZW order; defaults to the authored orientation"
+        ),
+    )
+    parser.add_argument(
+        "--pose-scenarios",
+        type=Path,
+        default=None,
+        help=(
+            "JSON scenario list for --pose-mode scenario; each item needs position and may "
+            "specify name, orientation, and background"
+        ),
+    )
+    parser.add_argument(
+        "--settle-mode",
+        choices=SETTLE_MODES,
+        default="physics",
+        help=(
+            "Pose settling: physics runs the existing settle loop; none captures the requested "
+            "pose while the timeline remains paused (default: physics)"
+        ),
     )
     parser.add_argument(
         "--scene-hold-seconds",
@@ -280,6 +328,142 @@ def validate_yolo_runtime(
             "the Isaac launcher before retrying. Do not reuse a different "
             "system Python's site-packages."
         )
+
+
+def _coerce_pose_position(value, *, name: str = "pose position") -> tuple[float, float, float]:
+    """Validate one world-space pose position without requiring Isaac Sim."""
+    position = np.asarray(value, dtype=np.float64)
+    if position.shape != (3,):
+        raise ValueError(f"{name} must contain exactly three values")
+    if not np.all(np.isfinite(position)):
+        raise ValueError(f"{name} must contain only finite values")
+    return tuple(float(component) for component in position)
+
+
+def _coerce_pose_orientation(
+    value,
+    *,
+    name: str = "pose orientation",
+) -> tuple[float, float, float, float]:
+    """Validate and normalize one XYZW world-space quaternion."""
+    orientation = np.asarray(value, dtype=np.float64)
+    if orientation.shape != (4,):
+        raise ValueError(f"{name} must contain exactly four values in XYZW order")
+    if not np.all(np.isfinite(orientation)):
+        raise ValueError(f"{name} must contain only finite values")
+    magnitude = float(np.linalg.norm(orientation))
+    if magnitude <= 1e-12:
+        raise ValueError(f"{name} must have nonzero length")
+    normalized = orientation / magnitude
+    return tuple(float(component) for component in normalized)
+
+
+def _xyzw_to_wxyz(value) -> np.ndarray:
+    """Convert the CLI/JSON XYZW convention to Isaac's WXYZ convention."""
+    x, y, z, w = np.asarray(value, dtype=np.float64)
+    return np.asarray([w, x, y, z], dtype=np.float64)
+
+
+def _wxyz_to_xyzw(value) -> np.ndarray:
+    """Convert Isaac's WXYZ convention to the CLI/JSON XYZW convention."""
+    w, x, y, z = np.asarray(value, dtype=np.float64)
+    return np.asarray([x, y, z, w], dtype=np.float64)
+
+
+def validate_pose_options(args: argparse.Namespace) -> None:
+    """Validate pose-mode and settling arguments before Isaac starts."""
+    mode = str(args.pose_mode)
+    settle_mode = str(args.settle_mode)
+    if mode not in POSE_MODES:
+        raise ValueError(f"--pose-mode must be one of {', '.join(POSE_MODES)}")
+    if settle_mode not in SETTLE_MODES:
+        raise ValueError(f"--settle-mode must be one of {', '.join(SETTLE_MODES)}")
+
+    has_position = args.pose_position is not None
+    has_orientation = args.pose_orientation is not None
+    has_scenarios = args.pose_scenarios is not None
+    if mode == "fixed" and not has_position:
+        raise ValueError("--pose-mode fixed requires --pose-position X Y Z")
+    if mode != "fixed" and (has_position or has_orientation):
+        raise ValueError("--pose-position and --pose-orientation require --pose-mode fixed")
+    if mode == "scenario" and not has_scenarios:
+        raise ValueError("--pose-mode scenario requires --pose-scenarios PATH")
+    if mode != "scenario" and has_scenarios:
+        raise ValueError("--pose-scenarios requires --pose-mode scenario")
+
+    if has_position:
+        _coerce_pose_position(args.pose_position, name="--pose-position")
+    if has_orientation:
+        _coerce_pose_orientation(args.pose_orientation, name="--pose-orientation")
+
+
+def load_pose_scenarios(
+    scenario_path: Path,
+    *,
+    backgrounds_dir: Path,
+    backgrounds: Sequence[Path],
+) -> list[dict]:
+    """Load and validate named pose scenarios from a JSON list or object."""
+    scenario_path = Path(scenario_path).expanduser().resolve()
+    if not scenario_path.is_file():
+        raise FileNotFoundError(f"Pose scenario file does not exist: {scenario_path}")
+    try:
+        payload = json.loads(scenario_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Pose scenario file is not valid JSON: {scenario_path}") from exc
+
+    if isinstance(payload, dict):
+        payload = payload.get("scenarios")
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("Pose scenario JSON must contain a non-empty list of scenarios")
+
+    backgrounds_dir = Path(backgrounds_dir).expanduser().resolve()
+    background_lookup = {
+        Path(background).expanduser().resolve(): Path(background)
+        for background in backgrounds
+    }
+    scenarios = []
+    for scenario_index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            raise ValueError(f"Pose scenario {scenario_index} must be an object")
+        name = str(item.get("name", f"scenario_{scenario_index:04d}")).strip()
+        if not name:
+            raise ValueError(f"Pose scenario {scenario_index} name must not be empty")
+        if "position" not in item:
+            raise ValueError(f"Pose scenario {name!r} requires position [x, y, z]")
+        position = _coerce_pose_position(
+            item["position"],
+            name=f"scenario {name!r} position",
+        )
+        orientation = None
+        if item.get("orientation") is not None:
+            orientation = _coerce_pose_orientation(
+                item["orientation"],
+                name=f"scenario {name!r} orientation",
+            )
+
+        background_path = None
+        if item.get("background") is not None:
+            background_reference = Path(str(item["background"])).expanduser()
+            if not background_reference.is_absolute():
+                background_reference = backgrounds_dir / background_reference
+            background_reference = background_reference.resolve()
+            background_path = background_lookup.get(background_reference)
+            if background_path is None:
+                raise ValueError(
+                    f"Pose scenario {name!r} background must name a PNG in {backgrounds_dir}: "
+                    f"{item['background']}"
+                )
+
+        scenarios.append(
+            {
+                "name": name,
+                "position": position,
+                "orientation": orientation,
+                "background_path": background_path,
+            }
+        )
+    return scenarios
 
 
 def find_backgrounds(backgrounds_dir: Path) -> list[Path]:
@@ -665,6 +849,7 @@ def main() -> None:
     args = parse_args()
     validate_yolo_options(args)
     validate_yolo_runtime(args.yolo_comparison_mode)
+    validate_pose_options(args)
     if args.settle_timeout <= 0:
         raise ValueError("--settle-timeout must be greater than zero")
     if args.scene_hold_seconds < 0:
@@ -686,6 +871,29 @@ def main() -> None:
     if not world_path.is_file():
         raise FileNotFoundError(f"USD stage does not exist: {world_path}")
     backgrounds = find_backgrounds(args.backgrounds_dir)
+    fixed_pose_position = (
+        None
+        if args.pose_position is None
+        else np.asarray(
+            _coerce_pose_position(args.pose_position, name="--pose-position"),
+            dtype=np.float64,
+        )
+    )
+    fixed_pose_orientation = (
+        None
+        if args.pose_orientation is None
+        else np.asarray(
+            _coerce_pose_orientation(args.pose_orientation, name="--pose-orientation"),
+            dtype=np.float64,
+        )
+    )
+    pose_scenarios = []
+    if args.pose_mode == "scenario":
+        pose_scenarios = load_pose_scenarios(
+            args.pose_scenarios,
+            backgrounds_dir=args.backgrounds_dir,
+            backgrounds=backgrounds,
+        )
 
     # Isaac Sim extension imports must happen after SimulationApp starts.
     from isaacsim import SimulationApp
@@ -895,40 +1103,108 @@ def main() -> None:
             print(f"Writing optional schema-v1 compatibility output: {legacy_output_path}")
         print(f"Writing annotated camera images: {image_output_dir}")
 
-        capture_count = len(backgrounds) if args.frames is None else args.frames
+        if args.pose_mode == "scenario":
+            capture_count = len(pose_scenarios) if args.frames is None else args.frames
+        else:
+            capture_count = len(backgrounds) if args.frames is None else args.frames
         for scene_index in range(capture_count):
-            background_path = backgrounds[scene_index % len(backgrounds)]
+            pose_scenario = (
+                pose_scenarios[scene_index % len(pose_scenarios)]
+                if args.pose_mode == "scenario"
+                else None
+            )
+            background_path = (
+                pose_scenario["background_path"]
+                if pose_scenario is not None and pose_scenario["background_path"] is not None
+                else backgrounds[scene_index % len(backgrounds)]
+            )
             # Cycle boundary: remove visualization from the previous capture
             # before changing the scene for the next one.
             if not args.headless:
                 clear_debug_draw()
 
-            # 1-2. Randomize the background and mannequin pose while paused.
+            # 1-2. Select the background and mannequin pose while paused.
             material.set_input_values("diffuse_texture", str(background_path))
-            random_position = authored_positions.copy()
-            random_position[0] = randomizer.uniform(
-                ground_center[0] - ground_half_extent[0], ground_center[0] + ground_half_extent[0]
-            )
-            random_position[1] = randomizer.uniform(
-                ground_center[1] - ground_half_extent[1], ground_center[1] + ground_half_extent[1]
-            )
-            random_position[2] = authored_positions[2] + MANNEQUIN_Z_OFFSET
+            if args.pose_mode == "random":
+                requested_position = authored_positions.copy()
+                requested_position[0] = randomizer.uniform(
+                    ground_center[0] - ground_half_extent[0],
+                    ground_center[0] + ground_half_extent[0],
+                )
+                requested_position[1] = randomizer.uniform(
+                    ground_center[1] - ground_half_extent[1],
+                    ground_center[1] + ground_half_extent[1],
+                )
+                requested_position[2] = authored_positions[2] + MANNEQUIN_Z_OFFSET
+                requested_orientation_wxyz = authored_orientations.copy()
+                requested_orientation_xyzw = _wxyz_to_xyzw(requested_orientation_wxyz)
+                pose_name = None
+            elif args.pose_mode == "fixed":
+                requested_position = fixed_pose_position.copy()
+                requested_orientation_xyzw = (
+                    _wxyz_to_xyzw(authored_orientations)
+                    if fixed_pose_orientation is None
+                    else fixed_pose_orientation.copy()
+                )
+                requested_orientation_wxyz = _xyzw_to_wxyz(requested_orientation_xyzw)
+                pose_name = "fixed"
+            else:
+                requested_position = np.asarray(pose_scenario["position"], dtype=np.float64)
+                requested_orientation_xyzw = (
+                    _wxyz_to_xyzw(authored_orientations)
+                    if pose_scenario["orientation"] is None
+                    else np.asarray(pose_scenario["orientation"], dtype=np.float64)
+                )
+                requested_orientation_wxyz = _xyzw_to_wxyz(requested_orientation_xyzw)
+                pose_name = pose_scenario["name"]
+
             mannequin.set_world_poses(
-                positions=[random_position],
-                orientations=[authored_orientations],
+                positions=[requested_position],
+                orientations=[requested_orientation_wxyz],
             )
             mannequin.set_velocities(
                 linear_velocities=np.zeros((1, 3), dtype=np.float32),
                 angular_velocities=np.zeros((1, 3), dtype=np.float32),
             )
-            print(f"[background] {background_path.name} at ({random_position[0]:.3f}, "
-                  f"{random_position[1]:.3f}, {random_position[2]:.3f})")
+            print(
+                f"[background] {background_path.name} "
+                f"pose_mode={args.pose_mode}"
+                + (f" scenario={pose_name!r}" if pose_name is not None else "")
+                + f" requested=({requested_position[0]:.3f}, "
+                f"{requested_position[1]:.3f}, {requested_position[2]:.3f})"
+            )
             simulation_app.update()  # Flush material and pose edits before playing.
-            timeline.play()
-            settled = settle_mannequin(simulation_app, mannequin, SimulationManager, args.settle_timeout)
-            timeline.pause()
-            if not settled:
-                print(f"[warning] Mannequin did not settle before timeout for {background_path.name}")
+            if args.settle_mode == "physics":
+                timeline.play()
+                settled = settle_mannequin(
+                    simulation_app,
+                    mannequin,
+                    SimulationManager,
+                    args.settle_timeout,
+                )
+                timeline.pause()
+                if not settled:
+                    print(
+                        f"[warning] Mannequin did not settle before timeout for {background_path.name}"
+                    )
+            else:
+                timeline.pause()
+                settled = False
+                simulation_app.update()
+
+            actual_positions, actual_orientations = mannequin.get_world_poses()
+            settled_position = actual_positions.numpy()[0].copy()
+            settled_orientation_xyzw = _wxyz_to_xyzw(actual_orientations.numpy()[0].copy())
+            pose_metadata = {
+                "mode": args.pose_mode,
+                "scenario_name": pose_name,
+                "requested_position_world": requested_position.tolist(),
+                "requested_orientation_xyzw": requested_orientation_xyzw.tolist(),
+                "settled_position_world": settled_position.tolist(),
+                "settled_orientation_xyzw": settled_orientation_xyzw.tolist(),
+                "settle_mode": args.settle_mode,
+                "physics_settled": bool(settled),
+            }
             if not simulation_app.is_running():
                 return
 
@@ -1182,6 +1458,7 @@ def main() -> None:
                 raw_bbox_paths=raw_bbox_paths,
                 raw_camera_params_paths=raw_camera_params_paths,
             )
+            schema_v2_record["capture"]["pose"] = pose_metadata
             if fusion_comparison is not None:
                 attach_yolo_comparison_record(
                     schema_v2_record,
@@ -1204,6 +1481,7 @@ def main() -> None:
                 "resolution": list(render_resolution),
                 "rt_subframes": args.rt_subframes,
                 "settled": bool(settled),
+                "pose": pose_metadata,
                 "cameras": [
                     {
                         "camera_path": observation.camera_path,
@@ -1233,7 +1511,7 @@ def main() -> None:
                     background_path=str(background_path),
                     target_prim_path=MANNEQUIN_PATH,
                     target_world=target_world,
-                    mannequin_position_world=random_position,
+                    mannequin_position_world=requested_position,
                     camera_aims=camera_aims,
                     rays=rays,
                     fusion_result=fusion_result,
@@ -1245,6 +1523,7 @@ def main() -> None:
                 ]
                 legacy_record["fusion_source"] = "bounding_box_centers"
                 legacy_record["image_paths"] = image_paths
+                legacy_record["pose"] = pose_metadata
                 legacy_output.write(
                     json.dumps(legacy_record, separators=(",", ":"), allow_nan=False) + "\n"
                 )

@@ -34,6 +34,36 @@ the mannequin pose and settle it, fire the synchronized four-camera capture,
 pause the timeline for inspection, then clear all transient rays and markers
 before the next cycle.
 
+## Deterministic pose controls
+
+The default `--pose-mode random` retains the seeded random placement. Use
+`--pose-mode fixed` with `--pose-position X Y Z` to capture one exact
+world-space position. `--pose-orientation QX QY QZ QW` is optional and uses
+XYZW quaternion order (converted to Isaac's internal WXYZ order); it defaults
+to the authored mannequin orientation.
+
+```bash
+/home/rog/Downloads/isaacsim/python.sh scripts/cycle_ground_backgrounds.py \
+  --pose-mode fixed --pose-position 0 0 0.5 \
+  --pose-orientation 0 0 0 1 --settle-mode none --frames 1
+```
+
+Use `--pose-mode scenario --pose-scenarios PATH` for a JSON list (or an object
+with a `scenarios` list). Each item requires `position: [x, y, z]` and may
+include `name`, `orientation: [qx, qy, qz, qw]` in XYZW order, and `background`.
+Background references must point to one of the PNGs discovered in
+`--backgrounds-dir`.
+Without `--frames`, scenario mode captures one scene per item; `--frames N`
+repeats the list in order.
+
+`--settle-mode physics` is the default and preserves the normal settle loop.
+`--settle-mode none` leaves the timeline paused after applying the requested
+transform, which is useful for testing exact edge-case positions and
+orientations. Each output record includes `requested_position_world`,
+`requested_orientation_xyzw`, `settled_position_world`,
+`settled_orientation_xyzw`, the settle mode, and whether physics reported a
+stable pose.
+
 ## Compare a local YOLO model
 
 YOLO is disabled unless both a model and comparison mode are selected. For
@@ -113,6 +143,10 @@ tight 2D boxes, and camera parameters enabled. The schema-v2 observation
 stores both `image_path` (annotated preview) and the corresponding raw paths
 (`raw_image_path`, `raw_bbox_path`, and `raw_camera_params_path`). The raw
 manifest records the same pairing for later YOLO export.
+
+The schema-v2 `capture.pose` block records the requested and read-back pose,
+the selected pose mode/scenario, the settle mode, and the physics-settled
+flag.
 
 ## Export a YOLO dataset
 

@@ -35,6 +35,11 @@ Useful options:
 --resolution WIDTH HEIGHT
 --rt-subframes N
 --seed N
+--pose-mode {random,fixed,scenario}
+--pose-position X Y Z
+--pose-orientation QX QY QZ QW
+--pose-scenarios PATH
+--settle-mode {physics,none}
 --max-occlusion-ratio 0.5
 --bbox-border-tolerance-px 0
 --schema-v2-output PATH
@@ -55,12 +60,58 @@ Useful options:
 Each background cycle follows this sequence:
 
 1. Randomize the background material.
-2. Randomize the mannequin position and settle physics.
+2. Select the mannequin pose (random, fixed, or scenario) and apply the chosen settling mode.
 3. Capture synchronized RGB and `bounding_box_2d_tight` views from all four cameras.
 4. Resolve semantic IDs, validate boxes, compute floating-point box centers, and fire bearing rays from every camera that sees the mannequin. Cameras that miss it remain in the capture with an invalid observation.
 5. Pause the timeline, fuse the rays, and display the valid estimate.
 6. Save annotated camera images and JSONL diagnostics.
 7. Clear all transient rays and markers before the next cycle.
+
+Random placement remains the default. For a repeatable edge case, use a fixed
+world-space pose and keep the timeline paused while capturing:
+
+```bash
+/home/rog/Downloads/isaacsim/python.sh \
+  scripts/cycle_ground_backgrounds.py \
+  --pose-mode fixed \
+  --pose-position 0.0 0.0 0.5 \
+  --pose-orientation 0.0 0.0 0.0 1.0 \
+  --settle-mode none \
+  --frames 1
+```
+
+For multiple deterministic edge cases, use a JSON scenario file. Each item
+requires `position: [x, y, z]`; `orientation: [qx, qy, qz, qw]` (the CLI uses
+XYZW order) and a background filename are optional. A scenario without a
+background uses the normal stable background cycle.
+
+```json
+[
+  {
+    "name": "left-edge",
+    "position": [-2.0, 0.0, 0.5],
+    "orientation": [0.0, 0.0, 0.0, 1.0],
+    "background": "background_01.png"
+  },
+  {"name": "right-edge", "position": [2.0, 0.0, 0.5]}
+]
+```
+
+Run it with:
+
+```bash
+/home/rog/Downloads/isaacsim/python.sh \
+  scripts/cycle_ground_backgrounds.py \
+  --pose-mode scenario \
+  --pose-scenarios scenarios.json \
+  --settle-mode none
+```
+
+With scenario mode and no `--frames`, one capture is generated per scenario;
+with `--frames`, scenarios repeat in file order. `--settle-mode physics`
+preserves the original physics-settling behavior. Every capture records the
+requested and read-back settled pose in the schema-v2 capture, raw manifest,
+and optional compatibility output.
 
 YOLO comparison is disabled by default. To compare a local detector against
 the same synchronized RGB frames, select a checkpoint and a timing mode:
@@ -201,6 +252,7 @@ write a schema-v1 compatibility record, explicitly provide:
 Each JSONL record contains:
 
 - capture metadata and synchronization settings;
+- requested and read-back deterministic pose metadata when pose controls are used;
 - four camera observations with calibration, pose, bbox, semantic identity,
   clipping/occlusion state, validity, annotated image path, and clean raw
   image/bbox/camera-parameter paths;
