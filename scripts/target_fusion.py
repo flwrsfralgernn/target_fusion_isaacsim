@@ -663,9 +663,6 @@ class FusionResult:
     condition_number: float
     valid: bool
     reason: str | None = None
-    # Retained as a compatibility field for schema-v1 callers. New fusion
-    # estimates never populate this; use ``evaluate_fusion`` instead.
-    error_m: float | None = None
     ray_diagnostics: list[dict] = field(default_factory=list)
     pairwise_angles_deg: list[float] = field(default_factory=list)
 
@@ -679,7 +676,6 @@ class FusionResult:
             "fused_position_world": (
                 None if self.fused_position_world is None else self.fused_position_world.tolist()
             ),
-            "error_m": None if self.error_m is None else float(self.error_m),
             "rms_residual_m": (
                 None if self.rms_residual_m is None else float(self.rms_residual_m)
             ),
@@ -881,49 +877,6 @@ def aim_cameras_at_target(
         )
         for camera_path in camera_paths
     ]
-
-
-def draw_ground_truth_rays(
-    rays: Sequence[CameraRay],
-    target_world,
-    *,
-    clear_existing: bool = True,
-    line_thickness: float = 3.0,
-    target_size: float = 12.0,
-    ray_color: tuple[float, float, float, float] = DEFAULT_GROUND_TRUTH_RAY_COLOR,
-    target_color: tuple[float, float, float, float] = DEFAULT_TARGET_COLOR,
-) -> dict:
-    """Draw exact camera-to-target rays and a target marker in the viewport.
-
-    The debug-draw primitives are transient and are not authored into the USD
-    stage.  Callers running headless can skip this function entirely.
-    """
-    if not rays:
-        raise ValueError("rays must contain at least one CameraRay")
-    if not isfinite(line_thickness) or line_thickness <= 0.0:
-        raise ValueError("line_thickness must be finite and positive")
-    if not isfinite(target_size) or target_size <= 0.0:
-        raise ValueError("target_size must be finite and positive")
-    target = _coerce_vector3(target_world, name="target_world")
-    from isaacsim.util.debug_draw import _debug_draw
-
-    draw_interface = _debug_draw.acquire_debug_draw_interface()
-    if clear_existing:
-        draw_interface.clear_lines()
-        draw_interface.clear_points()
-
-    start_points = [ray.origin_world.tolist() for ray in rays]
-    end_points = [target.tolist() for _ in rays]
-    colors = [list(ray_color) for _ in rays]
-    thicknesses = [line_thickness] * len(rays)
-    draw_interface.draw_lines(start_points, end_points, colors, thicknesses)
-    draw_interface.draw_points([target.tolist()], [list(target_color)], [target_size])
-    return {
-        "ray_count": len(rays),
-        "target_world": target,
-        "camera_colors": colors,
-        "ray_color": list(ray_color),
-    }
 
 
 def draw_fused_rays(
@@ -1294,89 +1247,6 @@ def evaluate_fusion(result: FusionResult, target_world) -> FusionEvaluation:
         )
     error_m = float(np.linalg.norm(result.fused_position_world - target))
     return FusionEvaluation(target_world=target, error_m=error_m, valid=True)
-
-
-def build_ground_truth_record(
-    *,
-    scene_index: int,
-    background_path: str,
-    target_prim_path: str,
-    target_world,
-    camera_aims: Sequence[dict],
-    rays: Sequence[CameraRay],
-    fusion_result: FusionResult,
-    fusion_evaluation: FusionEvaluation | None = None,
-    mannequin_position_world=None,
-    settled: bool,
-) -> dict:
-    """Build one JSON-compatible ground-truth record for a generated scene."""
-    if len(camera_aims) != len(rays):
-        raise ValueError("camera_aims and rays must contain the same number of entries")
-    if not rays and fusion_result.valid:
-        raise ValueError("at least one camera ray is required")
-    if not isinstance(fusion_result, FusionResult):
-        raise TypeError("fusion_result must be a FusionResult")
-    if fusion_evaluation is not None and not isinstance(fusion_evaluation, FusionEvaluation):
-        raise TypeError("fusion_evaluation must be a FusionEvaluation or None")
-
-    target = _coerce_vector3(target_world, name="target_world")
-    mannequin_position = None
-    if mannequin_position_world is not None:
-        mannequin_position = _coerce_vector3(
-            mannequin_position_world,
-            name="mannequin_position_world",
-        ).tolist()
-
-    cameras = []
-    for camera_aim, ray in zip(camera_aims, rays):
-        if not isinstance(camera_aim, dict):
-            raise TypeError("camera_aims must contain dictionaries")
-        if not isinstance(ray, CameraRay):
-            raise TypeError("rays must contain only CameraRay instances")
-        camera_path = str(camera_aim.get("camera_path", ""))
-        if not camera_path:
-            raise ValueError("each camera aim must contain a camera_path")
-        if camera_path != ray.camera_path:
-            raise ValueError(
-                f"camera aim path {camera_path!r} does not match ray path {ray.camera_path!r}"
-            )
-
-        cameras.append(
-            {
-                "camera_path": camera_path,
-                "position_world": _coerce_vector3(
-                    camera_aim["position_world"],
-                    name=f"{camera_path} position_world",
-                ).tolist(),
-                "forward_world": _coerce_vector3(
-                    camera_aim["forward_world"],
-                    name=f"{camera_path} forward_world",
-                ).tolist(),
-                "desired_forward_world": _coerce_vector3(
-                    camera_aim["desired_forward_world"],
-                    name=f"{camera_path} desired_forward_world",
-                ).tolist(),
-                "alignment": float(camera_aim["alignment"]),
-                "position_error_m": float(camera_aim["position_error_m"]),
-                "ray": ray.as_dict(),
-            }
-        )
-
-    record = {
-        "schema_version": 1,
-        "scene_index": int(scene_index),
-        "background_path": str(background_path),
-        "target_prim_path": str(target_prim_path),
-        "mannequin_position_world": mannequin_position,
-        "target_center_world": target.tolist(),
-        "settled": bool(settled),
-        "camera_count": len(cameras),
-        "cameras": cameras,
-        "fusion": fusion_result.as_dict(),
-    }
-    if fusion_evaluation is not None:
-        record["ground_truth_evaluation"] = fusion_evaluation.as_dict()
-    return record
 
 
 def build_schema_v2_record(

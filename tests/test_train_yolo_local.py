@@ -7,11 +7,13 @@ from PIL import Image
 from scripts.train_yolo_local import (
     _cache_value,
     audit_dataset,
+    resolve_device,
+    write_patched_data_yaml,
+)
+from scripts.validate_yolo_dataset import (
     label_dir_for_image_dir,
     load_data_yaml,
-    resolve_device,
     split_image_paths,
-    write_patched_data_yaml,
 )
 
 
@@ -47,10 +49,10 @@ class LocalYoloTrainingTests(unittest.TestCase):
             audit = audit_dataset(yaml_path)
 
             self.assertTrue(audit.valid, audit.errors)
-            self.assertEqual(audit.class_names, ("mannequin",))
+            self.assertEqual(audit.class_names, ["mannequin"])
             self.assertEqual(audit.total_objects, 2)
-            self.assertEqual(audit.splits[0].images, 1)
-            self.assertEqual(audit.splits[1].empty_labels, 0)
+            self.assertEqual(audit.split_counts["train"]["images"], 1)
+            self.assertEqual(audit.split_counts["val"]["empty_labels"], 0)
 
     def test_audit_accepts_colab_valid_split_name(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -74,7 +76,7 @@ class LocalYoloTrainingTests(unittest.TestCase):
             audit = audit_dataset(yaml_path)
 
             self.assertFalse(audit.valid)
-            self.assertTrue(any("in [0, 1]" in error for error in audit.splits[0].errors))
+            self.assertTrue(any("in [0, 1]" in error for error in audit.errors))
 
     def test_patched_yaml_maps_valid_to_val_without_mutating_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -1,5 +1,12 @@
 # Bounding-box target fusion
 
+The commands below run from the repository root and assume Isaac Sim's Python
+launcher has been configured as:
+
+```bash
+export ISAAC_SIM_PYTHON=/path/to/isaacsim/python.sh
+```
+
 `scripts/cycle_ground_backgrounds.py` captures the mannequin from four fixed
 USD perspective cameras. Each camera produces a synchronized
 `bounding_box_2d_tight` annotation. The floating-point box center is
@@ -10,10 +17,10 @@ from the visible cameras. A scene is marked valid only when all four boxes are
 valid and the ray geometry passes the rank, conditioning, and forward-distance
 checks.
 
-The default output is schema v2:
+Schema v2 is the only supported capture-record format:
 
 ```bash
-/home/rog/Downloads/isaacsim/python.sh scripts/cycle_ground_backgrounds.py \
+"$ISAAC_SIM_PYTHON" scripts/cycle_ground_backgrounds.py \
   --headless --schema-v2-output outputs/target_fusion_bbox_v2.jsonl
 ```
 
@@ -43,7 +50,7 @@ XYZW quaternion order (converted to Isaac's internal WXYZ order); it defaults
 to the authored mannequin orientation.
 
 ```bash
-/home/rog/Downloads/isaacsim/python.sh scripts/cycle_ground_backgrounds.py \
+"$ISAAC_SIM_PYTHON" scripts/cycle_ground_backgrounds.py \
   --pose-mode fixed --pose-position 0 0 0.5 \
   --pose-orientation 0 0 0 1 --settle-mode none --frames 1
 ```
@@ -71,20 +78,21 @@ example, compare a locally trained checkpoint using the same synchronized RGB
 capture as the ground truth:
 
 ```bash
-/home/rog/Downloads/isaacsim/python.sh scripts/cycle_ground_backgrounds.py \
+"$ISAAC_SIM_PYTHON" scripts/cycle_ground_backgrounds.py \
   --yolo-model outputs/yolo_training_runs/mannequin_yolo11n_bbox/weights/best.pt \
   --yolo-comparison-mode same-time \
   --headless
 ```
 
-The available modes are `after-ground-truth` and `same-time`. Both produce
-per-camera YOLO detections, rays, fusion, and comparison metrics in the
-schema-v2 record. The former performs YOLO after ground-truth fusion; the
-latter runs both computations from the same synchronized RGB frames. In GUI
-mode, ground-truth rays are green and YOLO rays are blue.
+The available modes are `after-ground-truth` and `same-time`. In these option
+names, “ground truth” means the Isaac semantic-bbox observation source. Both
+modes produce per-camera YOLO detections, rays, fusion, and comparison metrics
+in the schema-v2 record. The former performs YOLO after Isaac-annotation
+fusion; the latter runs both computations from the same synchronized RGB
+frames. In GUI mode, Isaac-annotation rays are green and YOLO rays are blue.
 
 In GUI `after-ground-truth` mode, the sources are displayed sequentially for
-five seconds each: green ground-truth rays first, then blue YOLO rays.
+five seconds each: green Isaac-annotation rays first, then blue YOLO rays.
 `same-time` displays both sources together. Headless captures still compute
 and record the same comparison data without the visual pauses.
 
@@ -101,22 +109,20 @@ Isaac Sim. The standalone Isaac Sim 6.0 package already bundles PyTorch
 Ultralytics without dependencies so pip does not download a second Torch copy:
 
 ```bash
-/home/rog/Downloads/isaacsim/python.sh -m pip install \
+"$ISAAC_SIM_PYTHON" -m pip install \
   --no-deps --no-cache-dir "ultralytics==8.4.80"
 ```
 
 Verify the environment with the same launcher used for capture, for example:
 
 ```bash
-/home/rog/Downloads/isaacsim/python.sh -c \
+"$ISAAC_SIM_PYTHON" -c \
   "from isaacsim import SimulationApp; app=SimulationApp({'headless': True}); import torch, ultralytics; print(torch.__version__, ultralytics.__version__); app.close()"
 ```
 
 Do not add packages from a different system Python's `site-packages` directory.
 
-The previous exact-coordinate schema-v1 file is not overwritten by default.
-Pass `--fusion-output PATH` only when a compatibility schema-v1 record is also
-needed. Summarize either format with:
+Summarize the schema-v2 output with:
 
 ```bash
 python3 scripts/report_target_fusion.py outputs/target_fusion_bbox_v2.jsonl
@@ -147,6 +153,37 @@ manifest records the same pairing for later YOLO export.
 The schema-v2 `capture.pose` block records the requested and read-back pose,
 the selected pose mode/scenario, the settle mode, and the physics-settled
 flag.
+
+## Schema-v2 record contract
+
+Every JSONL line is one synchronized capture with this top-level structure:
+
+```text
+schema_version: 2
+capture
+camera_observations[4]
+inferred_rays[4]
+fusion
+ground_truth_evaluation
+yolo                         # present only when comparison is enabled
+```
+
+`camera_observations` always contains all four configured cameras. A missed,
+clipped, malformed, or overly occluded observation remains in its camera slot
+with `valid: false` and a reason. `inferred_rays` has the same camera ordering;
+an observation that cannot produce a ray has `ray: null` and its rejection
+reason. This fixed cardinality prevents missing cameras from silently changing
+the meaning of array positions.
+
+The `fusion` block contains only estimator output and geometry diagnostics:
+the fused position, validity and rejection reason, RMS residual, matrix rank,
+condition number, pairwise angles, and per-ray forward/residual values. The
+true mannequin bounds center is not an estimator input. It appears only in
+`ground_truth_evaluation`, where it is used to measure the completed estimate.
+
+When enabled, `yolo` records model metadata, ordered inference results, YOLO
+observations and rays, detector fusion, per-camera comparisons, and aggregate
+metrics. It does not replace the primary Isaac-annotation observations.
 
 ## Export a YOLO dataset
 
@@ -198,6 +235,34 @@ Validation reports missing pairs, malformed or out-of-range rows, manifest
 drift, and any capture group assigned to more than one split. Empty `val` or
 `test` splits are warnings during smoke tests and can be made failures with
 `--strict`.
+
+## Train a local YOLO model
+
+Training reuses the same YAML parsing, image discovery, image checks, label
+parsing, and bbox validation code as the standalone validator. Its policy is
+adapted for ordinary YOLO datasets: `train` and `val` (or `valid`) must be
+nonempty, at least one labeled object must exist, and `test` and
+`manifest.jsonl` are optional.
+
+Audit without training:
+
+```bash
+python3 scripts/train_yolo_local.py \
+  --data outputs/yolo_mannequin/data.yaml \
+  --check-only
+```
+
+Start GPU-first training:
+
+```bash
+python3 scripts/train_yolo_local.py \
+  --data outputs/yolo_mannequin/data.yaml
+```
+
+Automatic device selection stops if CUDA is unavailable. Select
+`--device cpu` or pass `--allow-cpu` only when CPU training is intentional.
+Use `--eval-test` for an explicit post-training test-split evaluation and
+`--archive` to zip the completed run.
 
 The architecture-only stress suite exercises a 192-view synthetic fixture,
 compares two fresh exports for deterministic output, verifies append/resume

@@ -7,6 +7,7 @@ class YoloReportTests(unittest.TestCase):
     @staticmethod
     def _record() -> dict:
         return {
+            "schema_version": 2,
             "fusion": {"valid": True, "rms_residual_m": 0.1},
             "capture": {"valid_camera_count": 2},
             "yolo": {
@@ -65,10 +66,19 @@ class YoloReportTests(unittest.TestCase):
         self.assertEqual(summary["inference_miss_reasons"], {"no target detection": 1})
 
     def test_ground_truth_only_summary_remains_without_yolo_section(self) -> None:
-        summary = summarize_records([{"fusion": {"valid": False}}])
+        record = {
+            "schema_version": 2,
+            "capture": {"valid_camera_count": 0},
+            "fusion": {"valid": False},
+        }
+        summary = summarize_records([record])
 
-        self.assertIsNone(summarize_yolo_records([{"fusion": {"valid": False}}]))
+        self.assertIsNone(summarize_yolo_records([record]))
         self.assertNotIn("yolo", summary)
+
+    def test_schema_v1_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not a schema-v2"):
+            summarize_records([{"schema_version": 1}])
 
 
 if __name__ == "__main__":

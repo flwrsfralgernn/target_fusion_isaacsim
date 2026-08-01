@@ -8,14 +8,28 @@ bearing ray, and estimates the visual center from ray convergence.
 The source USD is never modified. Camera aiming and semantic labels are
 runtime, in-memory changes.
 
+For implementation details and guidance on interpreting the estimator, see
+[the target-fusion guide](docs/target_fusion.md).
+
+## Environments
+
+Capture must run through Isaac Sim's Python launcher. Set its location once
+for the examples below:
+
+```bash
+export ISAAC_SIM_PYTHON=/path/to/isaacsim/python.sh
+```
+
+Dataset export, validation, reporting, previews, and unit tests run with a
+regular Python 3 environment containing NumPy, Pillow, and PyYAML. Local
+training additionally requires Ultralytics and a suitable PyTorch build.
+
 ## Run a capture
 
 From the repository root:
 
 ```bash
-cd /home/rog/Downloads/UAVFORGEUCIsim
-
-/home/rog/Downloads/isaacsim/python.sh \
+"$ISAAC_SIM_PYTHON" \
   scripts/cycle_ground_backgrounds.py \
   --headless
 ```
@@ -29,7 +43,8 @@ For a GUI run, omit `--headless`. The default configuration is:
 - all four valid observations required for a valid scene; available camera
   observations still produce rays when another camera misses the mannequin
 
-Useful options:
+Use `"$ISAAC_SIM_PYTHON" scripts/cycle_ground_backgrounds.py --help` for the
+complete CLI. Common options are:
 
 ```text
 --resolution WIDTH HEIGHT
@@ -71,7 +86,7 @@ Random placement remains the default. For a repeatable edge case, use a fixed
 world-space pose and keep the timeline paused while capturing:
 
 ```bash
-/home/rog/Downloads/isaacsim/python.sh \
+"$ISAAC_SIM_PYTHON" \
   scripts/cycle_ground_backgrounds.py \
   --pose-mode fixed \
   --pose-position 0.0 0.0 0.5 \
@@ -91,7 +106,7 @@ background uses the normal stable background cycle.
     "name": "left-edge",
     "position": [-2.0, 0.0, 0.5],
     "orientation": [0.0, 0.0, 0.0, 1.0],
-    "background": "background_01.png"
+    "background": "01_aerial_grass_rock.png"
   },
   {"name": "right-edge", "position": [2.0, 0.0, 0.5]}
 ]
@@ -100,7 +115,7 @@ background uses the normal stable background cycle.
 Run it with:
 
 ```bash
-/home/rog/Downloads/isaacsim/python.sh \
+"$ISAAC_SIM_PYTHON" \
   scripts/cycle_ground_backgrounds.py \
   --pose-mode scenario \
   --pose-scenarios scenarios.json \
@@ -110,14 +125,13 @@ Run it with:
 With scenario mode and no `--frames`, one capture is generated per scenario;
 with `--frames`, scenarios repeat in file order. `--settle-mode physics`
 preserves the original physics-settling behavior. Every capture records the
-requested and read-back settled pose in the schema-v2 capture, raw manifest,
-and optional compatibility output.
+requested and read-back settled pose in the schema-v2 capture and raw manifest.
 
 YOLO comparison is disabled by default. To compare a local detector against
 the same synchronized RGB frames, select a checkpoint and a timing mode:
 
 ```bash
-/home/rog/Downloads/isaacsim/python.sh \
+"$ISAAC_SIM_PYTHON" \
   scripts/cycle_ground_backgrounds.py \
   --yolo-model outputs/yolo_training_runs/mannequin_yolo11n_bbox/weights/best.pt \
   --yolo-comparison-mode same-time \
@@ -127,13 +141,15 @@ the same synchronized RGB frames, select a checkpoint and a timing mode:
 The supported aliases `yolo11n.pt` and `yolo26n.pt` resolve from the repository
 root; explicit relative checkpoint paths resolve from the repository root as
 well. The checkpoint must be an Ultralytics detection model containing the
-selected `--target-label` (normally `mannequin`). `after-ground-truth` runs
-YOLO after the ground-truth fusion calculation, while `same-time` runs both
-from the same synchronized RGB capture. GUI comparison views draw ground-truth
-rays in green, YOLO rays in blue, and separate fused-position markers.
+selected `--target-label` (normally `mannequin`). Here, “ground truth” means
+the Isaac semantic-bbox observation source, not an older output schema.
+`after-ground-truth` runs YOLO after the Isaac-annotation fusion calculation,
+while `same-time` runs both from the same synchronized RGB capture. GUI
+comparison views draw Isaac-annotation rays in green, YOLO rays in blue, and
+separate fused-position markers.
 In GUI `after-ground-truth` mode, the sources are shown separately for five
-seconds each: green ground-truth rays first, then blue YOLO rays. `same-time`
-shows both sources together.
+seconds each: green Isaac-annotation rays first, then blue YOLO rays.
+`same-time` shows both sources together.
 
 Live YOLO capture requires `ultralytics` in Isaac Sim's own Python environment.
 The standalone Isaac Sim 6.0 package already bundles PyTorch
@@ -141,14 +157,14 @@ The standalone Isaac Sim 6.0 package already bundles PyTorch
 Ultralytics without dependencies so pip does not download a second Torch copy:
 
 ```bash
-/home/rog/Downloads/isaacsim/python.sh -m pip install \
+"$ISAAC_SIM_PYTHON" -m pip install \
   --no-deps --no-cache-dir "ultralytics==8.4.80"
 ```
 
 Verify with the same launcher used for capture:
 
 ```bash
-/home/rog/Downloads/isaacsim/python.sh -c \
+"$ISAAC_SIM_PYTHON" -c \
   "from isaacsim import SimulationApp; app=SimulationApp({'headless': True}); import torch, ultralytics; print(torch.__version__, ultralytics.__version__); app.close()"
 ```
 
@@ -208,6 +224,10 @@ python3 scripts/visualize_yolo_dataset.py \
   --output-dir outputs/yolo_mannequin/previews
 ```
 
+Standalone validation requires the exported `data.yaml`, train/val/test
+layout, and `manifest.jsonl`. Empty splits are warnings unless `--strict` is
+used.
+
 Architecture-only stress checks use temporary synthetic fixtures and do not
 capture Isaac data:
 
@@ -217,21 +237,22 @@ python3 -B -m unittest discover -s tests -v
 
 ## Train YOLO locally
 
-The attached Colab workflow is available as a GPU-first local script. It
-audits the pre-split normal-bbox dataset, writes a local-path YAML, and then
-trains YOLO11. It stops rather than silently falling back to CPU when CUDA is
-not available:
+The GPU-first local trainer runs the same image, label, YAML, and bbox checks
+as the standalone validator, then writes a local-path YAML and trains YOLO11.
+For training, `train` and `val` must be nonempty, at least one labeled object
+must exist, and `test` and `manifest.jsonl` are optional. The trainer stops
+rather than silently falling back to CPU when CUDA is unavailable:
 
 ```bash
 python3 scripts/train_yolo_local.py \
-  --data outputs/autovalidated_sdg_final/yolo/data.yaml
+  --data outputs/yolo_mannequin/data.yaml
 ```
 
 Run the audit without starting training:
 
 ```bash
 python3 scripts/train_yolo_local.py \
-  --data outputs/autovalidated_sdg_final/yolo/data.yaml \
+  --data outputs/yolo_mannequin/data.yaml \
   --check-only
 ```
 
@@ -239,15 +260,9 @@ Useful options include `--model yolo11s.pt`, `--batch 16`, `--cache disk`,
 `--resume PATH/last.pt`, `--eval-test`, and `--archive`. Training outputs are
 kept under `outputs/yolo_training_runs/` and ignored by Git.
 
-The existing exact-coordinate baseline at
-`outputs/target_fusion_ground_truth.jsonl` is preserved by default. To also
-write a schema-v1 compatibility record, explicitly provide:
-
-```bash
---fusion-output outputs/compatibility.jsonl
-```
-
 ## Schema-v2 contents
+
+Schema v2 is the only supported capture-record schema.
 
 Each JSONL record contains:
 
@@ -275,7 +290,7 @@ such as IoU, center error, ray-angle error, and fused-position delta.
 
 ## Diagnostics report
 
-Summarize either schema-v1 or schema-v2 JSONL with:
+Summarize schema-v2 JSONL with:
 
 ```bash
 python3 scripts/report_target_fusion.py \
@@ -290,15 +305,6 @@ For captures made with YOLO comparison enabled, the same report automatically
 adds a `yolo` section with model/mode counts, detection and four-camera rates,
 inference latency, confidence, bbox IoU, center and ray-angle errors,
 fused-position deltas, YOLO position error, and miss/fusion reasons.
-
-A seeded eight-scene bbox capture previously produced:
-
-- 6/8 valid four-camera fusions (`75%`);
-- mean position error: `0.117 m`;
-- maximum position error: `0.258 m`;
-- mean RMS residual: `0.109 m`;
-- mean minimum ray angle: `56.7°`;
-- mean condition number: `1.31`.
 
 ## Tests
 

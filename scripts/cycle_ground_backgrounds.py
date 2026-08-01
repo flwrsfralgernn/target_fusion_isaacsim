@@ -33,7 +33,6 @@ DEFAULT_CAMERA_PATHS = [
     "/World/Camera_03",
     "/World/Camera_04",
 ]
-DEFAULT_FUSION_OUTPUT = PROJECT_DIR / "outputs" / "target_fusion_ground_truth.jsonl"
 DEFAULT_SCHEMA_V2_OUTPUT = PROJECT_DIR / "outputs" / "target_fusion_bbox_v2.jsonl"
 DEFAULT_IMAGE_OUTPUT_DIR = PROJECT_DIR / "outputs" / "target_fusion_bbox_v2_images"
 DEFAULT_RAW_OUTPUT_DIR = PROJECT_DIR / "outputs" / "sdg_raw"
@@ -180,15 +179,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=2.0,
         help="Seconds to hold each GUI scene after visualization is added (default: 2.0)",
-    )
-    parser.add_argument(
-        "--fusion-output",
-        type=Path,
-        default=None,
-        help=(
-            "Optional compatibility schema-v1 output path; disabled by default so the "
-            f"existing baseline at {DEFAULT_FUSION_OUTPUT} is preserved"
-        ),
     )
     parser.add_argument(
         "--schema-v2-output",
@@ -900,7 +890,6 @@ def main() -> None:
 
     simulation_app = SimulationApp({"headless": args.headless})
     schema_v2_output = None
-    legacy_output = None
     raw_manifest_output = None
     writer = None
     loaded_yolo_model = None
@@ -923,7 +912,6 @@ def main() -> None:
             DEFAULT_GROUND_TRUTH_RAY_COLOR,
             aim_cameras_at_target,
             build_rays_from_available_observations,
-            build_ground_truth_record,
             build_schema_v2_record,
             clear_debug_draw,
             compute_world_target_center,
@@ -1071,13 +1059,10 @@ def main() -> None:
         print(f"Found {len(backgrounds)} PNG background(s) in {args.backgrounds_dir.resolve()}")
         print(f"Validated camera prim(s): {', '.join(args.camera_prims)}")
         schema_v2_output_path = args.schema_v2_output.expanduser().resolve()
-        output_paths = [schema_v2_output_path]
-        if args.fusion_output is not None:
-            output_paths.append(args.fusion_output.expanduser().resolve())
-        if any(path == world_path or path in backgrounds for path in output_paths):
-            raise ValueError("fusion output paths must not overwrite the USD stage or a background image")
-        if len(set(output_paths)) != len(output_paths):
-            raise ValueError("schema-v2 and compatibility output paths must be different")
+        if schema_v2_output_path == world_path or schema_v2_output_path in backgrounds:
+            raise ValueError(
+                "schema-v2 output must not overwrite the USD stage or a background image"
+            )
         image_output_dir = args.image_output_dir.expanduser().resolve()
         if image_output_dir == world_path or image_output_dir in backgrounds:
             raise ValueError("--image-output-dir must not overwrite the USD stage or a background image")
@@ -1096,11 +1081,6 @@ def main() -> None:
         print(f"Writing schema-v2 fusion output: {schema_v2_output_path}")
         print(f"Writing Isaac BasicWriter raw outputs: {raw_output_dir}")
         print(f"Writing raw capture manifest: {raw_manifest_path}")
-        if args.fusion_output is not None:
-            legacy_output_path = output_paths[1]
-            legacy_output_path.parent.mkdir(parents=True, exist_ok=True)
-            legacy_output = legacy_output_path.open("w", encoding="utf-8")
-            print(f"Writing optional schema-v1 compatibility output: {legacy_output_path}")
         print(f"Writing annotated camera images: {image_output_dir}")
 
         if args.pose_mode == "scenario":
@@ -1307,11 +1287,6 @@ def main() -> None:
                 )
             else:
                 fusion_result = partial_fusion
-            camera_aims = [
-                fixed_camera_aim
-                for fixed_camera_aim, observation in zip(fixed_camera_aims, observations)
-                if observation.valid
-            ]
             fusion_evaluation = evaluate_fusion(fusion_result, target_world)
             yolo_observations = None
             yolo_source_fusion = None
@@ -1505,29 +1480,6 @@ def main() -> None:
                 json.dumps(raw_manifest_record, separators=(",", ":"), allow_nan=False) + "\n"
             )
             raw_manifest_output.flush()
-            if legacy_output is not None:
-                legacy_record = build_ground_truth_record(
-                    scene_index=scene_index,
-                    background_path=str(background_path),
-                    target_prim_path=MANNEQUIN_PATH,
-                    target_world=target_world,
-                    mannequin_position_world=requested_position,
-                    camera_aims=camera_aims,
-                    rays=rays,
-                    fusion_result=fusion_result,
-                    fusion_evaluation=fusion_evaluation,
-                    settled=settled,
-                )
-                legacy_record["bbox_observations"] = [
-                    observation.as_dict() for observation in observations
-                ]
-                legacy_record["fusion_source"] = "bounding_box_centers"
-                legacy_record["image_paths"] = image_paths
-                legacy_record["pose"] = pose_metadata
-                legacy_output.write(
-                    json.dumps(legacy_record, separators=(",", ":"), allow_nan=False) + "\n"
-                )
-                legacy_output.flush()
             if not args.headless and not sequential_yolo_displayed:
                 hold_scene(simulation_app, args.scene_hold_seconds)
                 # 5. End the cycle with a clean viewport for the next scene.
@@ -1547,8 +1499,6 @@ def main() -> None:
                 pass
         if schema_v2_output is not None:
             schema_v2_output.close()
-        if legacy_output is not None:
-            legacy_output.close()
         if raw_manifest_output is not None:
             raw_manifest_output.close()
         if writer is not None:

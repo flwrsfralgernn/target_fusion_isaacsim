@@ -1,7 +1,6 @@
-"""Summarize target-fusion JSONL capture quality and geometry diagnostics.
+"""Summarize schema-v2 target-fusion capture quality and geometry diagnostics.
 
-The report accepts both the schema-v1 compatibility records and schema-v2
-records. It intentionally reports truth error only from the separate
+The report intentionally reads truth error only from the separate
 ``ground_truth_evaluation`` block; no ground-truth coordinate is used for
 validity or fusion statistics.
 """
@@ -49,14 +48,22 @@ def _stats(values) -> dict:
 
 def _valid_camera_count(record: dict) -> int:
     capture = record.get("capture")
-    if isinstance(capture, dict) and "valid_camera_count" in capture:
-        return int(capture["valid_camera_count"])
-    observations = record.get("camera_observations") or record.get("bbox_observations") or []
-    return sum(bool(observation.get("valid")) for observation in observations)
+    if not isinstance(capture, dict) or "valid_camera_count" not in capture:
+        raise ValueError("schema-v2 record has no capture.valid_camera_count")
+    return int(capture["valid_camera_count"])
+
+
+def _require_schema_v2(records) -> list[dict]:
+    records = list(records)
+    for index, record in enumerate(records):
+        if not isinstance(record, dict) or record.get("schema_version") != 2:
+            raise ValueError(f"record {index} is not a schema-v2 object")
+    return records
 
 
 def summarize_yolo_records(records) -> dict | None:
     """Summarize optional YOLO comparison blocks embedded in schema-v2 records."""
+    records = _require_schema_v2(records)
     yolo_records = [record for record in records if isinstance(record.get("yolo"), dict)]
     if not yolo_records:
         return None
@@ -172,7 +179,7 @@ def summarize_yolo_records(records) -> dict | None:
 
 def summarize_records(records) -> dict:
     """Return capture-rate, error, residual, angle, and conditioning statistics."""
-    records = list(records)
+    records = _require_schema_v2(records)
     valid_records = [record for record in records if bool(record.get("fusion", {}).get("valid"))]
     evaluations = [
         record.get("ground_truth_evaluation", {}).get("error_m")
@@ -221,7 +228,7 @@ def load_jsonl(path: Path) -> list[dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("jsonl", type=Path, help="schema-v1 or schema-v2 fusion JSONL file")
+    parser.add_argument("jsonl", type=Path, help="schema-v2 fusion JSONL file")
     args = parser.parse_args()
     path = args.jsonl.expanduser().resolve()
     if not path.is_file():

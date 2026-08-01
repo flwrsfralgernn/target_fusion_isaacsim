@@ -1,11 +1,10 @@
-"""Train a normal YOLO11 bounding-box detector locally.
+"""Validate and train a YOLO11 bounding-box detector locally.
 
-This is the local equivalent of the attached Colab workflow.  It expects an
-already split YOLO detection dataset and never creates a train/validation/test
-split.  The generated SDG dataset can be used directly:
+The trainer expects an already split YOLO detection dataset and never creates
+a train/validation/test split. The schema-v2 export can be used directly:
 
     python3 scripts/train_yolo_local.py \
-        --data outputs/autovalidated_sdg_final/yolo/data.yaml
+        --data outputs/yolo_mannequin/data.yaml
 
 The default mode is GPU-first: an unavailable CUDA device is an error unless
 the caller explicitly selects ``--device cpu`` or passes ``--allow-cpu``.
@@ -15,66 +14,32 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import shutil
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+try:
+    from validate_yolo_dataset import (
+        ValidationReport,
+        load_data_yaml,
+        split_image_paths,
+        validate_data_yaml,
+    )
+except ModuleNotFoundError:
+    from scripts.validate_yolo_dataset import (
+        ValidationReport,
+        load_data_yaml,
+        split_image_paths,
+        validate_data_yaml,
+    )
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
-DEFAULT_DATA_YAML = PROJECT_DIR / "outputs" / "autovalidated_sdg_final" / "yolo" / "data.yaml"
+DEFAULT_DATA_YAML = PROJECT_DIR / "outputs" / "yolo_mannequin" / "data.yaml"
 DEFAULT_TRAINING_PROJECT = PROJECT_DIR / "outputs" / "yolo_training_runs"
 DEFAULT_ARCHIVE_DIR = PROJECT_DIR / "outputs" / "yolo_training_archives"
-IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-
-
-@dataclass(frozen=True)
-class SplitAudit:
-    """Dataset counts and errors for one YOLO split."""
-
-    name: str
-    image_dir: str
-    label_dir: str
-    images: int
-    labels: int
-    missing_labels: int
-    extra_labels: int
-    empty_labels: int
-    objects: int
-    errors: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class DatasetAudit:
-    """Full pre-training dataset audit."""
-
-    data_yaml: str
-    dataset_root: str
-    class_names: tuple[str, ...]
-    splits: tuple[SplitAudit, ...]
-    errors: tuple[str, ...] = ()
-
-    @property
-    def total_objects(self) -> int:
-        return sum(split.objects for split in self.splits)
-
-    @property
-    def valid(self) -> bool:
-        return not self.errors and all(not split.errors for split in self.splits)
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "data_yaml": self.data_yaml,
-            "dataset_root": self.dataset_root,
-            "class_names": list(self.class_names),
-            "splits": [asdict(split) for split in self.splits],
-            "total_objects": self.total_objects,
-            "valid": self.valid,
-            "errors": list(self.errors),
-        }
 
 
 def parse_args() -> argparse.Namespace:
@@ -201,250 +166,14 @@ def _require_yaml():
     return yaml
 
 
-def load_data_yaml(data_yaml_path: Path) -> tuple[dict[str, Any], Path, tuple[str, ...]]:
-    """Load a YOLO YAML and resolve its dataset root and class names."""
-    data_yaml_path = Path(data_yaml_path).expanduser().resolve()
-    if not data_yaml_path.is_file():
-        raise FileNotFoundError(f"YOLO data YAML does not exist: {data_yaml_path}")
-
-    yaml = _require_yaml()
-    with data_yaml_path.open("r", encoding="utf-8") as stream:
-        config = yaml.safe_load(stream) or {}
-    if not isinstance(config, dict):
-        raise ValueError(f"YOLO data YAML must contain a mapping: {data_yaml_path}")
-
-    names = config.get("names")
-    if isinstance(names, dict):
-        try:
-            class_names = tuple(str(names[key]) for key in sorted(names, key=lambda item: int(item)))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"Unsupported names mapping in {data_yaml_path}") from exc
-    elif isinstance(names, list):
-        class_names = tuple(str(name) for name in names)
-    else:
-        raise ValueError(f"YOLO data YAML requires a names list or mapping: {data_yaml_path}")
-    if not class_names:
-        raise ValueError(f"YOLO data YAML contains no classes: {data_yaml_path}")
-
-    root_value = config.get("path", ".")
-    root = Path(str(root_value)).expanduser()
-    if not root.is_absolute():
-        root = data_yaml_path.parent / root
-    return config, root.resolve(), class_names
-
-
-def _config_paths(root: Path, value: Any) -> list[Path]:
-    """Resolve one YOLO split value, including list-valued entries."""
-    values = value if isinstance(value, list) else [value]
-    paths = []
-    for item in values:
-        path = Path(str(item)).expanduser()
-        if not path.is_absolute():
-            path = root / path
-        paths.append(path.resolve())
-    return paths
-
-
-def split_image_paths(config: dict[str, Any], root: Path) -> dict[str, list[Path]]:
-    """Return canonical train/val/test image directories from a YOLO YAML."""
-    if "train" not in config:
-        raise ValueError("YOLO data YAML is missing the train split")
-    val_key = "val" if "val" in config else "valid" if "valid" in config else None
-    if val_key is None:
-        raise ValueError("YOLO data YAML is missing the val/valid split")
-
-    paths = {
-        "train": _config_paths(root, config["train"]),
-        "val": _config_paths(root, config[val_key]),
-    }
-    if "test" in config and config["test"] is not None:
-        paths["test"] = _config_paths(root, config["test"])
-    return paths
-
-
-def label_dir_for_image_dir(image_dir: Path) -> Path:
-    """Resolve the conventional YOLO labels sibling for an images folder."""
-    image_dir = Path(image_dir).resolve()
-    if image_dir.name == "images":
-        return image_dir.parent / "labels"
-    return image_dir / "labels"
-
-
-def _collect_images(image_dirs: list[Path]) -> tuple[dict[str, Path], list[str]]:
-    images: dict[str, Path] = {}
-    errors: list[str] = []
-    for image_dir in image_dirs:
-        if not image_dir.is_dir():
-            errors.append(f"missing image directory: {image_dir}")
-            continue
-        for path in sorted(image_dir.rglob("*"), key=lambda item: item.as_posix().lower()):
-            if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
-                continue
-            previous = images.get(path.stem)
-            if previous is not None:
-                errors.append(f"duplicate image stem {path.stem!r}: {previous}, {path}")
-            else:
-                images[path.stem] = path.resolve()
-    return images, errors
-
-
-def _collect_labels(label_dirs: list[Path]) -> tuple[dict[str, Path], list[str]]:
-    labels: dict[str, Path] = {}
-    errors: list[str] = []
-    for label_dir in label_dirs:
-        if not label_dir.is_dir():
-            errors.append(f"missing label directory: {label_dir}")
-            continue
-        for path in sorted(label_dir.rglob("*.txt"), key=lambda item: item.as_posix().lower()):
-            previous = labels.get(path.stem)
-            if previous is not None:
-                errors.append(f"duplicate label stem {path.stem!r}: {previous}, {path}")
-            else:
-                labels[path.stem] = path.resolve()
-    return labels, errors
-
-
-def _read_image_size(image_path: Path) -> tuple[int, int]:
-    try:
-        from PIL import Image
-    except ModuleNotFoundError as exc:
-        raise RuntimeError(
-            "Pillow is required for dataset auditing. Install training dependencies with: "
-            "python3 -m pip install --user ultralytics pyyaml pillow"
-        ) from exc
-    try:
-        with Image.open(image_path) as image:
-            image.load()
-            width, height = image.size
-    except Exception as exc:
-        raise ValueError(f"could not read image {image_path}: {exc}") from exc
-    if width <= 0 or height <= 0:
-        raise ValueError(f"image has invalid dimensions {width}x{height}: {image_path}")
-    return int(width), int(height)
-
-
-def _audit_label_file(
-    label_path: Path,
-    *,
-    image_size: tuple[int, int],
-    class_count: int,
-) -> tuple[int, bool, list[str]]:
-    """Return object count, empty status, and row-level errors."""
-    errors: list[str] = []
-    try:
-        lines = [line.strip() for line in label_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    except Exception as exc:
-        return 0, False, [f"could not read label file {label_path}: {exc}"]
-    if not lines:
-        return 0, True, []
-
-    image_width, image_height = image_size
-    objects = 0
-    for line_number, line in enumerate(lines, start=1):
-        prefix = f"{label_path}:{line_number}"
-        parts = line.split()
-        if len(parts) != 5:
-            errors.append(f"{prefix}: expected 5 YOLO bbox fields, got {len(parts)}")
-            continue
-        try:
-            class_id = int(parts[0])
-            x_center, y_center, width, height = (float(value) for value in parts[1:])
-        except (TypeError, ValueError, OverflowError) as exc:
-            errors.append(f"{prefix}: malformed numeric value: {exc}")
-            continue
-        values = (x_center, y_center, width, height)
-        if class_id < 0 or class_id >= class_count:
-            errors.append(f"{prefix}: class id {class_id} is outside [0, {class_count})")
-            continue
-        if not all(math.isfinite(value) for value in values):
-            errors.append(f"{prefix}: bbox values must be finite")
-            continue
-        if not all(0.0 <= value <= 1.0 for value in values):
-            errors.append(f"{prefix}: bbox values must be in [0, 1]")
-            continue
-        if width <= 0.0 or height <= 0.0:
-            errors.append(f"{prefix}: bbox width and height must be positive")
-            continue
-        if x_center - width / 2.0 < 0.0 or x_center + width / 2.0 > 1.0:
-            errors.append(f"{prefix}: bbox extends outside horizontal image bounds")
-            continue
-        if y_center - height / 2.0 < 0.0 or y_center + height / 2.0 > 1.0:
-            errors.append(f"{prefix}: bbox extends outside vertical image bounds")
-            continue
-        objects += 1
-    return objects, False, errors
-
-
-def audit_dataset(data_yaml_path: Path) -> DatasetAudit:
-    """Validate split structure and normal YOLO bbox labels before training."""
-    config, root, class_names = load_data_yaml(data_yaml_path)
-    split_paths = split_image_paths(config, root)
-    split_audits: list[SplitAudit] = []
-    dataset_errors: list[str] = []
-
-    for split_name in ("train", "val", "test"):
-        image_dirs = split_paths.get(split_name)
-        if image_dirs is None:
-            if split_name == "test":
-                continue
-            dataset_errors.append(f"missing required {split_name} split")
-            continue
-        label_dirs = [label_dir_for_image_dir(path) for path in image_dirs]
-        images, image_errors = _collect_images(image_dirs)
-        labels, label_errors = _collect_labels(label_dirs)
-        errors = [*image_errors, *label_errors]
-        missing_labels = sorted(set(images) - set(labels))
-        extra_labels = sorted(set(labels) - set(images))
-        errors.extend(f"missing label for image stem {stem!r}" for stem in missing_labels)
-        errors.extend(f"label has no matching image stem {stem!r}" for stem in extra_labels)
-
-        empty_labels = 0
-        objects = 0
-        for stem in sorted(set(images) & set(labels)):
-            image_path = images[stem]
-            label_path = labels[stem]
-            try:
-                image_size = _read_image_size(image_path)
-                row_objects, is_empty, row_errors = _audit_label_file(
-                    label_path,
-                    image_size=image_size,
-                    class_count=len(class_names),
-                )
-            except (RuntimeError, ValueError) as exc:
-                row_objects, is_empty, row_errors = 0, False, [str(exc)]
-            objects += row_objects
-            empty_labels += int(is_empty)
-            errors.extend(row_errors)
-
-        split_audits.append(
-            SplitAudit(
-                name=split_name,
-                image_dir=", ".join(str(path) for path in image_dirs),
-                label_dir=", ".join(str(path) for path in label_dirs),
-                images=len(images),
-                labels=len(labels),
-                missing_labels=len(missing_labels),
-                extra_labels=len(extra_labels),
-                empty_labels=empty_labels,
-                objects=objects,
-                errors=tuple(errors),
-            )
-        )
-
-    required_by_name = {split.name: split for split in split_audits}
-    for required_split in ("train", "val"):
-        split = required_by_name.get(required_split)
-        if split is None or split.images == 0:
-            dataset_errors.append(f"required {required_split} split contains no images")
-    if sum(split.objects for split in split_audits) == 0:
-        dataset_errors.append("no labeled objects found in the dataset")
-
-    return DatasetAudit(
-        data_yaml=str(Path(data_yaml_path).expanduser().resolve()),
-        dataset_root=str(root),
-        class_names=class_names,
-        splits=tuple(split_audits),
-        errors=tuple(dataset_errors),
+def audit_dataset(data_yaml_path: Path) -> ValidationReport:
+    """Run the shared validator with the pre-training contract."""
+    return validate_data_yaml(
+        data_yaml_path,
+        allow_missing_manifest=True,
+        required_splits=("train", "val"),
+        nonempty_splits=("train", "val"),
+        require_labeled_objects=True,
     )
 
 
@@ -547,10 +276,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     audit = audit_dataset(args.data_yaml)
     if not audit.valid:
         raise RuntimeError(
-            "Dataset audit failed:\n" + "\n".join(
-                [*audit.errors]
-                + [error for split in audit.splits for error in split.errors]
-            )
+            "Dataset audit failed:\n" + "\n".join(audit.errors)
         )
 
     project_dir = args.project.expanduser().resolve()
@@ -657,7 +383,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     summary = {
         "data_yaml": str(Path(args.data_yaml).expanduser().resolve()),
         "patched_data_yaml": str(patched_yaml_path),
-        "dataset_root": audit.dataset_root,
+        "dataset_root": audit.dataset_dir,
         "class_names": list(audit.class_names),
         "device": str(device),
         "model": str(args.resume if args.resume is not None else args.model),

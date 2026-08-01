@@ -9,11 +9,11 @@ leakage.
 from __future__ import annotations
 
 import argparse
-import ast
 import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any, Sequence
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -35,6 +35,7 @@ class YoloLabelRow:
 @dataclass
 class ValidationReport:
     dataset_dir: str
+    data_yaml: str | None = None
     class_names: list[str] = field(default_factory=list)
     split_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     manifest_sample_count: int = 0
@@ -46,14 +47,20 @@ class ValidationReport:
     def valid(self) -> bool:
         return not self.errors
 
+    @property
+    def total_objects(self) -> int:
+        return sum(counts.get("boxes", 0) for counts in self.split_counts.values())
+
     def as_dict(self) -> dict:
         return {
             "dataset_dir": self.dataset_dir,
+            "data_yaml": self.data_yaml,
             "valid": self.valid,
             "class_names": self.class_names,
             "split_counts": self.split_counts,
             "manifest_sample_count": self.manifest_sample_count,
             "capture_group_count": self.capture_group_count,
+            "total_objects": self.total_objects,
             "errors": self.errors,
             "warnings": self.warnings,
         }
@@ -86,39 +93,91 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _parse_yaml_value(value: str):
-    value = value.strip()
+def _require_yaml():
     try:
-        return ast.literal_eval(value)
-    except (SyntaxError, ValueError):
-        return value.strip("'\"")
+        import yaml
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "PyYAML is required for YOLO dataset validation. Install it with: "
+            "python3 -m pip install --user pyyaml"
+        ) from exc
+    return yaml
 
 
-def load_dataset_config(dataset_dir: Path) -> dict:
-    """Parse the small data.yaml contract emitted by the exporter."""
-    dataset_dir = Path(dataset_dir).expanduser().resolve()
-    yaml_path = dataset_dir / "data.yaml"
-    if not yaml_path.is_file():
-        raise FileNotFoundError(f"Missing YOLO data.yaml: {yaml_path}")
-    config = {}
-    for line_number, line in enumerate(yaml_path.read_text(encoding="utf-8").splitlines(), start=1):
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        key, separator, value = stripped.partition(":")
-        if not separator:
-            raise ValueError(f"Malformed data.yaml line {line_number}: {line}")
-        config[key.strip()] = _parse_yaml_value(value)
+def load_data_yaml(data_yaml_path: Path) -> tuple[dict[str, Any], Path, tuple[str, ...]]:
+    """Load a YOLO data YAML and resolve its dataset root and class names."""
+    data_yaml_path = Path(data_yaml_path).expanduser().resolve()
+    if not data_yaml_path.is_file():
+        raise FileNotFoundError(f"YOLO data YAML does not exist: {data_yaml_path}")
+
+    yaml = _require_yaml()
+    with data_yaml_path.open("r", encoding="utf-8") as stream:
+        config = yaml.safe_load(stream) or {}
+    if not isinstance(config, dict):
+        raise ValueError(f"YOLO data YAML must contain a mapping: {data_yaml_path}")
 
     names = config.get("names")
     if isinstance(names, dict):
         try:
-            names = [str(names[key]) for key in sorted(names, key=lambda item: int(item))]
+            class_names = tuple(str(names[key]) for key in sorted(names, key=lambda item: int(item)))
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"Unsupported names mapping in {yaml_path}") from exc
-    if not isinstance(names, list) or not names or not all(isinstance(name, str) for name in names):
-        raise ValueError(f"data.yaml names must be a nonempty list: {yaml_path}")
-    config["names"] = names
+            raise ValueError(f"Unsupported names mapping in {data_yaml_path}") from exc
+    elif isinstance(names, list):
+        class_names = tuple(str(name) for name in names)
+    else:
+        raise ValueError(f"YOLO data YAML requires a names list or mapping: {data_yaml_path}")
+    if not class_names:
+        raise ValueError(f"YOLO data YAML contains no classes: {data_yaml_path}")
+
+    root = Path(str(config.get("path", "."))).expanduser()
+    if not root.is_absolute():
+        root = data_yaml_path.parent / root
+    return config, root.resolve(), class_names
+
+
+def _config_paths(root: Path, value: Any) -> list[Path]:
+    values = value if isinstance(value, list) else [value]
+    paths = []
+    for item in values:
+        path = Path(str(item)).expanduser()
+        if not path.is_absolute():
+            path = root / path
+        paths.append(path.resolve())
+    return paths
+
+
+def split_image_paths(config: dict[str, Any], root: Path) -> dict[str, list[Path]]:
+    """Resolve train/val/test image directories, accepting ``valid`` as ``val``."""
+    if "train" not in config:
+        raise ValueError("YOLO data YAML is missing the train split")
+    val_key = "val" if "val" in config else "valid" if "valid" in config else None
+    if val_key is None:
+        raise ValueError("YOLO data YAML is missing the val/valid split")
+
+    paths = {
+        "train": _config_paths(root, config["train"]),
+        "val": _config_paths(root, config[val_key]),
+    }
+    if "test" in config and config["test"] is not None:
+        paths["test"] = _config_paths(root, config["test"])
+    return paths
+
+
+def label_dir_for_image_dir(image_dir: Path) -> Path:
+    image_dir = Path(image_dir).resolve()
+    if image_dir.name == "images":
+        return image_dir.parent / "labels"
+    return image_dir / "labels"
+
+
+def load_dataset_config(dataset_dir: Path) -> dict:
+    """Load the exported dataset's ``data.yaml`` contract."""
+    dataset_dir = Path(dataset_dir).expanduser().resolve()
+    config, _, class_names = load_data_yaml(dataset_dir / "data.yaml")
+    config = dict(config)
+    config["names"] = list(class_names)
+    if "val" not in config and "valid" in config:
+        config["val"] = config["valid"]
     return config
 
 
@@ -168,6 +227,36 @@ def collect_split_labels(labels_dir: Path) -> dict[str, Path]:
             raise ValueError(f"multiple label files share stem {path.stem!r}: {previous}, {path}")
         labels[path.stem] = path
     return labels
+
+
+def _collect_split_files(
+    directories: Sequence[Path],
+    *,
+    labels: bool,
+) -> tuple[dict[str, Path], list[str]]:
+    """Collect files across one or more split directories with unique stems."""
+    collected: dict[str, Path] = {}
+    errors: list[str] = []
+    for directory in directories:
+        if not directory.is_dir():
+            kind = "label" if labels else "image"
+            errors.append(f"missing {kind} directory: {directory}")
+            continue
+        candidates = directory.rglob("*.txt") if labels else directory.rglob("*")
+        for path in sorted(candidates, key=lambda item: item.as_posix().lower()):
+            if not path.is_file():
+                continue
+            if labels:
+                if path.suffix.lower() != ".txt":
+                    continue
+            elif path.suffix.lower() not in IMAGE_SUFFIXES:
+                continue
+            previous = collected.get(path.stem)
+            if previous is not None:
+                errors.append(f"duplicate {'label' if labels else 'image'} stem {path.stem!r}: {previous}, {path}")
+            else:
+                collected[path.stem] = path.resolve()
+    return collected, errors
 
 
 def read_image_size(image_path: Path) -> tuple[int, int]:
@@ -371,39 +460,65 @@ def _validate_manifest(
             report.errors.append(f"manifest references unknown labels: {extra[:5]}")
 
 
-def validate_dataset(
-    dataset_dir: Path,
+def validate_data_yaml(
+    data_yaml_path: Path,
     *,
-    allow_missing_manifest: bool = False,
+    allow_missing_manifest: bool = True,
     strict: bool = False,
+    required_splits: Sequence[str] = ("train", "val"),
+    nonempty_splits: Sequence[str] = ("train", "val"),
+    require_labeled_objects: bool = True,
 ) -> ValidationReport:
-    """Validate a YOLO dataset and return all discovered issues."""
-    dataset_dir = dataset_dir.expanduser().resolve()
-    report = ValidationReport(dataset_dir=str(dataset_dir))
+    """Validate the dataset described by a YOLO YAML for training or export use."""
+    data_yaml_path = Path(data_yaml_path).expanduser().resolve()
     try:
-        config = load_dataset_config(dataset_dir)
-        report.class_names = list(config["names"])
+        config, dataset_root, class_names = load_data_yaml(data_yaml_path)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        return ValidationReport(
+            dataset_dir=str(data_yaml_path.parent),
+            data_yaml=str(data_yaml_path),
+            errors=[str(exc)],
+        )
+
+    report = ValidationReport(
+        dataset_dir=str(dataset_root),
+        data_yaml=str(data_yaml_path),
+        class_names=list(class_names),
+    )
+    try:
+        split_paths = split_image_paths(config, dataset_root)
+    except ValueError as exc:
         report.errors.append(str(exc))
         return report
 
+    required = set(required_splits)
+    nonempty = set(nonempty_splits)
+    unsupported = (required | nonempty) - set(SPLIT_NAMES)
+    if unsupported:
+        raise ValueError(f"unsupported required split(s): {sorted(unsupported)}")
+
     split_pairs: dict[str, dict[str, tuple[Path, Path]]] = {}
     for split_name in SPLIT_NAMES:
-        try:
-            split_root = resolve_split_directory(dataset_dir, config, split_name)
-            labels_root = resolve_split_label_directory(dataset_dir, config, split_name)
-            images = collect_split_images(split_root)
-            labels = collect_split_labels(labels_root)
-        except (FileNotFoundError, ValueError) as exc:
-            report.errors.append(str(exc))
+        image_dirs = split_paths.get(split_name)
+        if image_dirs is None:
+            if split_name in required:
+                report.errors.append(f"missing required {split_name} split")
             report.split_counts[split_name] = {
                 "images": 0,
                 "labels": 0,
                 "boxes": 0,
                 "empty_labels": 0,
+                "missing_labels": 0,
+                "extra_labels": 0,
             }
             split_pairs[split_name] = {}
             continue
+
+        label_dirs = [label_dir_for_image_dir(path) for path in image_dirs]
+        images, image_errors = _collect_split_files(image_dirs, labels=False)
+        labels, label_errors = _collect_split_files(label_dirs, labels=True)
+        report.errors.extend(image_errors)
+        report.errors.extend(label_errors)
 
         missing_labels = sorted(set(images) - set(labels))
         orphan_labels = sorted(set(labels) - set(images))
@@ -449,20 +564,44 @@ def validate_dataset(
             "labels": len(labels),
             "boxes": box_count,
             "empty_labels": empty_label_count,
+            "missing_labels": len(missing_labels),
+            "extra_labels": len(orphan_labels),
         }
         if not images:
             report.warnings.append(f"{split_name}: split contains no images")
+            if split_name in nonempty:
+                report.errors.append(f"required {split_name} split contains no images")
         split_pairs[split_name] = pairs
 
     _validate_manifest(
-        dataset_dir,
+        data_yaml_path.parent,
         report,
         split_pairs,
         allow_missing_manifest=allow_missing_manifest,
     )
+    if require_labeled_objects and report.total_objects == 0:
+        report.errors.append("no labeled objects found in the dataset")
     if strict and report.warnings:
         report.errors.extend(f"warning treated as error: {warning}" for warning in report.warnings)
     return report
+
+
+def validate_dataset(
+    dataset_dir: Path,
+    *,
+    allow_missing_manifest: bool = False,
+    strict: bool = False,
+) -> ValidationReport:
+    """Validate the full train/val/test contract emitted by the exporter."""
+    dataset_dir = Path(dataset_dir).expanduser().resolve()
+    return validate_data_yaml(
+        dataset_dir / "data.yaml",
+        allow_missing_manifest=allow_missing_manifest,
+        strict=strict,
+        required_splits=SPLIT_NAMES,
+        nonempty_splits=(),
+        require_labeled_objects=False,
+    )
 
 
 def main() -> int:

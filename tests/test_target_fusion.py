@@ -16,7 +16,6 @@ from scripts.target_fusion import (
     build_rays_from_available_observations,
     extract_target_bbox,
     build_ground_truth_ray,
-    build_ground_truth_record,
     build_schema_v2_record,
     evaluate_fusion,
     fuse_rays,
@@ -379,66 +378,6 @@ class TargetFusionMathTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot share the target position"):
             build_ground_truth_ray("camera", [1.0, 2.0, 3.0], self.target)
 
-    def test_ground_truth_record_is_json_serializable(self) -> None:
-        rays = [
-            build_ground_truth_ray(f"camera_{index}", origin, self.target)
-            for index, origin in enumerate(self.origins)
-        ]
-        camera_aims = [
-            {
-                "camera_path": ray.camera_path,
-                "position_world": ray.origin_world,
-                "forward_world": ray.direction_world,
-                "desired_forward_world": ray.direction_world,
-                "alignment": 1.0,
-                "position_error_m": 0.0,
-            }
-            for ray in rays
-        ]
-        fusion_result = fuse_rays(rays)
-        record = build_ground_truth_record(
-            scene_index=3,
-            background_path="background.png",
-            target_prim_path="/World/Mannequin",
-            target_world=self.target,
-            mannequin_position_world=[1.0, 2.0, 0.5],
-            camera_aims=camera_aims,
-            rays=rays,
-            fusion_result=fusion_result,
-            settled=True,
-        )
-
-        encoded = json.dumps(record, allow_nan=False)
-        decoded = json.loads(encoded)
-        self.assertEqual(decoded["schema_version"], 1)
-        self.assertEqual(decoded["camera_count"], 4)
-        self.assertEqual(decoded["fusion"]["valid"], True)
-        self.assertEqual(decoded["cameras"][0]["ray"]["camera_path"], "camera_0")
-
-    def test_invalid_ground_truth_record_can_preserve_zero_valid_rays(self) -> None:
-        fusion_result = FusionResult(
-            fused_position_world=None,
-            rms_residual_m=None,
-            rank=0,
-            condition_number=float("inf"),
-            valid=False,
-            reason="required four valid camera observations; got 0",
-        )
-        record = build_ground_truth_record(
-            scene_index=4,
-            background_path="background.png",
-            target_prim_path="/World/Mannequin",
-            target_world=self.target,
-            camera_aims=[],
-            rays=[],
-            fusion_result=fusion_result,
-            settled=False,
-        )
-        encoded = json.dumps(record, allow_nan=False)
-        decoded = json.loads(encoded)
-        self.assertEqual(decoded["camera_count"], 0)
-        self.assertFalse(decoded["fusion"]["valid"])
-
     def test_schema_v2_separates_observations_rays_and_truth_evaluation(self) -> None:
         observations = []
         rays = []
@@ -595,6 +534,7 @@ class TargetFusionMathTests(unittest.TestCase):
     def test_report_summarizes_validity_and_geometry(self) -> None:
         records = [
             {
+                "schema_version": 2,
                 "fusion": {
                     "valid": True,
                     "rms_residual_m": 0.1,
@@ -605,6 +545,7 @@ class TargetFusionMathTests(unittest.TestCase):
                 "capture": {"valid_camera_count": 4},
             },
             {
+                "schema_version": 2,
                 "fusion": {"valid": False, "reason": "missing camera"},
                 "capture": {"valid_camera_count": 3},
             },
