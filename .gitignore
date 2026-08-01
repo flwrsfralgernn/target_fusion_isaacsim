@@ -1,3 +1,6 @@
+# Ignore every generated artifact under the repository output directory.
+/outputs/
+
 # Generated Isaac Sim SDG captures and YOLO exports.
 outputs/autovalidated_sdg*/
 
