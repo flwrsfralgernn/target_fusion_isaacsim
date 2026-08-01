@@ -37,6 +37,7 @@ DEFAULT_SCHEMA_V2_OUTPUT = PROJECT_DIR / "outputs" / "target_fusion_bbox_v2.json
 DEFAULT_IMAGE_OUTPUT_DIR = PROJECT_DIR / "outputs" / "target_fusion_bbox_v2_images"
 DEFAULT_RAW_OUTPUT_DIR = PROJECT_DIR / "outputs" / "sdg_raw"
 YOLO_COMPARISON_MODES = ("disabled", "after-ground-truth", "same-time")
+YOLO_SEQUENTIAL_HOLD_SECONDS = 5.0
 RAW_FRAME_PADDING = 6
 GROUND_PLANE_PATH = "/World/GroundPlane"
 GROUND_MESH_PATH = "/World/GroundPlane/CollisionMesh"
@@ -718,6 +719,7 @@ def main() -> None:
             build_schema_v2_record,
             clear_debug_draw,
             compute_world_target_center,
+            compute_display_ray_length_to_ground,
             draw_comparison_rays,
             draw_fused_rays,
             evaluate_fusion,
@@ -1070,23 +1072,65 @@ def main() -> None:
                     inference_results=yolo_inference_results,
                 )
             simulation_app.update()  # Flush camera orientation edits before drawing.
+            sequential_yolo_displayed = False
             if not args.headless:
                 if fusion_comparison is not None:
-                    draw_comparison_rays(
-                        ground_truth_rays=rays,
-                        yolo_rays=yolo_source_fusion.rays,
-                        ground_truth_fused_position_world=(
-                            fusion_result.fused_position_world
-                            if fusion_result.valid
-                            else None
-                        ),
-                        yolo_fused_position_world=(
-                            yolo_source_fusion.fusion.fused_position_world
-                            if yolo_source_fusion.fusion.valid
-                            else None
-                        ),
-                        truth_world=target_world,
+                    comparison_rays = [*rays, *yolo_source_fusion.rays]
+                    comparison_ray_length = compute_display_ray_length_to_ground(
+                        comparison_rays,
+                        ground_plane_z=0.0,
+                        extra_length_m=1.0,
                     )
+                    if args.yolo_comparison_mode == "after-ground-truth":
+                        # Sequential mode is intentionally a visual sequence:
+                        # show the two sources separately so nearly coincident
+                        # rays do not hide one another in the viewport.
+                        draw_comparison_rays(
+                            ground_truth_rays=rays,
+                            yolo_rays=[],
+                            ground_truth_fused_position_world=(
+                                fusion_result.fused_position_world
+                                if fusion_result.valid
+                                else None
+                            ),
+                            truth_world=target_world,
+                            ray_length=comparison_ray_length,
+                        )
+                        hold_scene(simulation_app, YOLO_SEQUENTIAL_HOLD_SECONDS)
+                        clear_debug_draw()
+                        if not simulation_app.is_running():
+                            return
+                        draw_comparison_rays(
+                            ground_truth_rays=[],
+                            yolo_rays=yolo_source_fusion.rays,
+                            yolo_fused_position_world=(
+                                yolo_source_fusion.fusion.fused_position_world
+                                if yolo_source_fusion.fusion.valid
+                                else None
+                            ),
+                            truth_world=target_world,
+                            ray_length=comparison_ray_length,
+                        )
+                        hold_scene(simulation_app, YOLO_SEQUENTIAL_HOLD_SECONDS)
+                        clear_debug_draw()
+                        sequential_yolo_displayed = True
+                    else:
+                        draw_comparison_rays(
+                            ground_truth_rays=rays,
+                            yolo_rays=yolo_source_fusion.rays,
+                            ground_truth_fused_position_world=(
+                                fusion_result.fused_position_world
+                                if fusion_result.valid
+                                else None
+                            ),
+                            yolo_fused_position_world=(
+                                yolo_source_fusion.fusion.fused_position_world
+                                if yolo_source_fusion.fusion.valid
+                                else None
+                            ),
+                            truth_world=target_world,
+                            ray_length=comparison_ray_length,
+                        )
                 elif rays and fusion_result.valid:
                     draw_fused_rays(
                         rays,
@@ -1205,7 +1249,7 @@ def main() -> None:
                     json.dumps(legacy_record, separators=(",", ":"), allow_nan=False) + "\n"
                 )
                 legacy_output.flush()
-            if not args.headless:
+            if not args.headless and not sequential_yolo_displayed:
                 hold_scene(simulation_app, args.scene_hold_seconds)
                 # 5. End the cycle with a clean viewport for the next scene.
                 clear_debug_draw()

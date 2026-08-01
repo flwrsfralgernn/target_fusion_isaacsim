@@ -80,6 +80,9 @@ selected `--target-label` (normally `mannequin`). `after-ground-truth` runs
 YOLO after the ground-truth fusion calculation, while `same-time` runs both
 from the same synchronized RGB capture. GUI comparison views draw ground-truth
 rays in green, YOLO rays in blue, and separate fused-position markers.
+In GUI `after-ground-truth` mode, the sources are shown separately for five
+seconds each: green ground-truth rays first, then blue YOLO rays. `same-time`
+shows both sources together.
 
 Live YOLO capture requires `ultralytics` in Isaac Sim's own Python environment.
 The standalone Isaac Sim 6.0 package already bundles PyTorch

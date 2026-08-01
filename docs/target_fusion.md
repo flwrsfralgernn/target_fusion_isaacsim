@@ -53,6 +53,11 @@ schema-v2 record. The former performs YOLO after ground-truth fusion; the
 latter runs both computations from the same synchronized RGB frames. In GUI
 mode, ground-truth rays are green and YOLO rays are blue.
 
+In GUI `after-ground-truth` mode, the sources are displayed sequentially for
+five seconds each: green ground-truth rays first, then blue YOLO rays.
+`same-time` displays both sources together. Headless captures still compute
+and record the same comparison data without the visual pauses.
+
 `yolo11n.pt` and `yolo26n.pt` are supported aliases for checkpoints at the
 repository root. Any explicit local `.pt` path is also accepted; the model
 must be an Ultralytics detection checkpoint containing the configured target

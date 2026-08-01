@@ -550,6 +550,47 @@ class CameraRay:
         }
 
 
+def compute_display_ray_length_to_ground(
+    rays: Sequence[CameraRay],
+    *,
+    ground_plane_z: float = 0.0,
+    extra_length_m: float = 1.0,
+    fallback_length_m: float = 10.0,
+) -> float:
+    """Return one shared display length that carries downward rays into ground.
+
+    The visualizer uses one common length for ground-truth and YOLO rays so
+    their directions remain comparable.  The common length is based on the
+    farthest positive intersection with the horizontal ground plane, plus a
+    small margin below the plane.  Rays that do not point toward the plane
+    are ignored; ``fallback_length_m`` keeps the helper useful for isolated
+    visualization tests and upward-pointing rays.
+    """
+    if not isfinite(float(ground_plane_z)):
+        raise ValueError("ground_plane_z must be finite")
+    extra_length = float(extra_length_m)
+    fallback_length = float(fallback_length_m)
+    if not isfinite(extra_length) or extra_length < 0.0:
+        raise ValueError("extra_length_m must be finite and nonnegative")
+    if not isfinite(fallback_length) or fallback_length <= 0.0:
+        raise ValueError("fallback_length_m must be finite and positive")
+
+    ground_intersections = []
+    for ray in rays:
+        if not isinstance(ray, CameraRay):
+            raise TypeError("rays must contain only CameraRay instances")
+        direction_z = float(ray.direction_world[2])
+        if direction_z >= -_VECTOR_EPSILON:
+            continue
+        distance = (float(ground_plane_z) - float(ray.origin_world[2])) / direction_z
+        if isfinite(distance) and distance > _VECTOR_EPSILON:
+            ground_intersections.append(distance)
+
+    if not ground_intersections:
+        return fallback_length
+    return max(fallback_length, max(ground_intersections) + extra_length)
+
+
 def build_camera_ray_from_pixel(
     calibration: CameraCalibration,
     pixel_uv,

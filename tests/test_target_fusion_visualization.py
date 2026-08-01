@@ -12,6 +12,7 @@ from scripts.target_fusion import (
     DEFAULT_YOLO_FUSED_COLOR,
     DEFAULT_YOLO_RAY_COLOR,
     CameraRay,
+    compute_display_ray_length_to_ground,
     draw_comparison_rays,
 )
 
@@ -59,6 +60,28 @@ def debug_draw_modules(debug_draw):
 
 
 class ComparisonRayVisualizationTests(unittest.TestCase):
+    def test_display_length_reaches_ground_with_margin(self) -> None:
+        rays = [
+            CameraRay("near", [0, 0, 8], [0, 0, -1]),
+            CameraRay("far", [1, 0, 25], [0, 0, -1]),
+        ]
+
+        self.assertEqual(
+            compute_display_ray_length_to_ground(rays, ground_plane_z=0.0),
+            26.0,
+        )
+
+    def test_display_length_uses_fallback_when_rays_do_not_point_down(self) -> None:
+        ray = CameraRay("upward", [0, 0, 8], [0, 0, 1])
+
+        self.assertEqual(
+            compute_display_ray_length_to_ground(
+                [ray],
+                fallback_length_m=12.0,
+            ),
+            12.0,
+        )
+
     def test_overlay_uses_shared_length_and_distinct_source_colors(self) -> None:
         interface = FakeDrawInterface()
         debug_draw = FakeDebugDraw(interface)
