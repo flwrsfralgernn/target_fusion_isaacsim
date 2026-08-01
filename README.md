@@ -197,15 +197,16 @@ Isaac ground-truth rays, the ground-truth fused position, and the true target
 marker. Press Enter again to advance to the next trial. Enter `q` at either
 prompt to exit cleanly. The viewport remains responsive while the script waits.
 
-The fixed trials cover a clean baseline, a positional offset, reduced camera
-resolution, difficult illumination, and a combined position/resolution/color/
-pixel-noise challenge. Before each prediction, the terminal reports the exact
+The fixed trials progress from a clean baseline to a near-boundary target,
+0.40x resolution with pixel noise, harsh warm underexposure, and a combined
+position/resolution/bright-cool/pixel-noise challenge. The stress settings are
+intentionally stronger than the training distribution. Before each prediction, the terminal reports the exact
 position and camera changes plus per-camera confidence or miss reasons. It
 prints bbox, center, ray-angle, and fused-position comparisons when ground
 truth is revealed.
 
-Every run creates a timestamped directory under
-`outputs/yolo_prediction_demo/`. Each trial saves four `camera_XX_input.png`
+Every run creates a timestamped directory under the dedicated repository-root
+folder `yolo_prediction_demo/`. Each trial saves four `camera_XX_input.png`
 files and four `camera_XX_prediction.png` files. The input files are the exact
 noise-processed RGB frames supplied to YOLO; prediction files are separate
 copies containing the selected mannequin box and confidence. No normal

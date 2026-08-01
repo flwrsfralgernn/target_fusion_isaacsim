@@ -108,7 +108,7 @@ DEFAULT_MODEL = (
     / "weights"
     / "best.pt"
 )
-DEFAULT_OUTPUT_ROOT = PROJECT_DIR / "outputs" / "yolo_prediction_demo"
+DEFAULT_OUTPUT_ROOT = PROJECT_DIR / "yolo_prediction_demo"
 DEMO_RESOLUTION = (640, 480)
 DEMO_TARGET_LABEL = "mannequin"
 DEMO_RT_SUBFRAMES = 1
@@ -138,32 +138,33 @@ DEMO_TRIALS = (
     DemoTrial(
         "Positional challenge",
         "07_road_001.png",
-        position_fraction_xy=(0.35, -0.20),
+        position_fraction_xy=(0.80, -0.60),
         seed=202,
     ),
     DemoTrial(
         "Reduced camera resolution",
         "03_gravel_ground_01.png",
-        resolution_scale=0.75,
+        resolution_scale=0.40,
+        rgb_noise_std=12.0,
         seed=303,
     ),
     DemoTrial(
         "Difficult illumination",
         "04_forest_ground_01.png",
-        brightness_offset=-0.06,
-        exposure_stops=-0.40,
-        color_temperature_k=4800.0,
+        brightness_offset=-0.10,
+        exposure_stops=-1.00,
+        color_temperature_k=3800.0,
         seed=404,
     ),
     DemoTrial(
         "Combined stress",
         "06_asphalt_023s.png",
-        position_fraction_xy=(-0.40, 0.30),
-        resolution_scale=0.75,
-        brightness_offset=0.04,
-        exposure_stops=0.30,
-        color_temperature_k=8000.0,
-        rgb_noise_std=8.0,
+        position_fraction_xy=(-0.75, 0.70),
+        resolution_scale=0.50,
+        brightness_offset=0.08,
+        exposure_stops=0.75,
+        color_temperature_k=9500.0,
+        rgb_noise_std=18.0,
         seed=505,
     ),
 )

@@ -8,7 +8,9 @@ import numpy as np
 from PIL import Image
 
 from scripts.demo_yolo_prediction_first import (
+    DEFAULT_OUTPUT_ROOT,
     DEMO_TRIALS,
+    PROJECT_DIR,
     apply_trial_camera_condition,
     format_trial_changes,
     ground_truth_view_kwargs,
@@ -85,6 +87,10 @@ def miss_result() -> YoloInferenceResult:
 
 
 class PredictionFirstDemoTests(unittest.TestCase):
+    def test_demo_output_is_a_dedicated_project_root_folder(self) -> None:
+        self.assertEqual(DEFAULT_OUTPUT_ROOT.name, "yolo_prediction_demo")
+        self.assertEqual(DEFAULT_OUTPUT_ROOT.parent, PROJECT_DIR)
+
     def test_five_trials_have_fixed_expected_conditions(self) -> None:
         self.assertEqual(len(DEMO_TRIALS), 5)
         self.assertEqual(
@@ -97,10 +103,11 @@ class PredictionFirstDemoTests(unittest.TestCase):
                 "Combined stress",
             ],
         )
-        self.assertEqual(DEMO_TRIALS[1].position_fraction_xy, (0.35, -0.20))
-        self.assertEqual(DEMO_TRIALS[2].resolution_scale, 0.75)
-        self.assertEqual(DEMO_TRIALS[3].color_temperature_k, 4800.0)
-        self.assertEqual(DEMO_TRIALS[4].rgb_noise_std, 8.0)
+        self.assertEqual(DEMO_TRIALS[1].position_fraction_xy, (0.80, -0.60))
+        self.assertEqual(DEMO_TRIALS[2].resolution_scale, 0.40)
+        self.assertEqual(DEMO_TRIALS[2].rgb_noise_std, 12.0)
+        self.assertEqual(DEMO_TRIALS[3].color_temperature_k, 3800.0)
+        self.assertEqual(DEMO_TRIALS[4].rgb_noise_std, 18.0)
         self.assertEqual(len(DEMO_TRIALS) * 4 * 2, 40)
 
     def test_relative_position_resolves_to_metric_offset(self) -> None:
@@ -110,8 +117,8 @@ class PredictionFirstDemoTests(unittest.TestCase):
             ground_half_extent=[4.0, 5.0, 0.0],
             z_position=0.5,
         )
-        np.testing.assert_allclose(offset, [1.4, -1.0, 0.0])
-        np.testing.assert_allclose(position, [11.4, 19.0, 0.5])
+        np.testing.assert_allclose(offset, [3.2, -3.0, 0.0])
+        np.testing.assert_allclose(position, [13.2, 17.0, 0.5])
 
     def test_clean_condition_is_identity_and_combined_is_deterministic(self) -> None:
         frame = np.full((24, 32, 3), 100, dtype=np.uint8)
@@ -134,24 +141,24 @@ class PredictionFirstDemoTests(unittest.TestCase):
         self.assertEqual(clean_resolution, (32, 24))
         np.testing.assert_array_equal(first, second)
         self.assertFalse(np.array_equal(first, frame))
-        self.assertEqual(first_resolution, (24, 18))
+        self.assertEqual(first_resolution, (16, 12))
         self.assertEqual(second_resolution, first_resolution)
 
     def test_change_report_distinguishes_position_and_camera_conditions(self) -> None:
         positional = format_trial_changes(
             DEMO_TRIALS[1],
-            position_offset=[1.4, -1.0, 0.0],
+            position_offset=[3.2, -3.0, 0.0],
             intermediate_resolution=(640, 480),
         )
         combined = format_trial_changes(
             DEMO_TRIALS[4],
-            position_offset=[-1.6, 1.5, 0.0],
-            intermediate_resolution=(480, 360),
+            position_offset=[-3.0, 3.5, 0.0],
+            intermediate_resolution=(320, 240),
         )
-        self.assertIn("X=+1.400 m", positional[1])
+        self.assertIn("X=+3.200 m", positional[1])
         self.assertEqual(positional[2], "Camera condition: clean")
-        self.assertIn("resolution 0.75x", combined[2])
-        self.assertIn("RGB Gaussian pixel noise sigma=8.0", combined[2])
+        self.assertIn("resolution 0.50x", combined[2])
+        self.assertIn("RGB Gaussian pixel noise sigma=18.0", combined[2])
 
     def test_saves_exact_input_and_separate_prediction_overlay(self) -> None:
         frame = np.full((6, 10, 3), (12, 34, 56), dtype=np.uint8)
