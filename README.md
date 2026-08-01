@@ -181,6 +181,45 @@ In GUI `after-ground-truth` mode, the sources are shown separately for five
 seconds each: green Isaac-annotation rays first, then blue YOLO rays.
 `same-time` shows both sources together.
 
+## Run the prediction-first interactive demo
+
+After training has produced the default `best.pt` checkpoint, launch the
+five-trial presentation from an interactive terminal:
+
+```bash
+/home/rog/Downloads/isaacsim/python.sh \
+  scripts/demo_yolo_prediction_first.py
+```
+
+Each trial displays blue YOLO rays and the predicted fused position first.
+Press Enter in the launching terminal to clear that view and reveal green
+Isaac ground-truth rays, the ground-truth fused position, and the true target
+marker. Press Enter again to advance to the next trial. Enter `q` at either
+prompt to exit cleanly. The viewport remains responsive while the script waits.
+
+The fixed trials cover a clean baseline, a positional offset, reduced camera
+resolution, difficult illumination, and a combined position/resolution/color/
+pixel-noise challenge. Before each prediction, the terminal reports the exact
+position and camera changes plus per-camera confidence or miss reasons. It
+prints bbox, center, ray-angle, and fused-position comparisons when ground
+truth is revealed.
+
+Every run creates a timestamped directory under
+`outputs/yolo_prediction_demo/`. Each trial saves four `camera_XX_input.png`
+files and four `camera_XX_prediction.png` files. The input files are the exact
+noise-processed RGB frames supplied to YOLO; prediction files are separate
+copies containing the selected mannequin box and confidence. No normal
+BasicWriter dataset or schema-v2 artifact tree is created by this demo.
+
+The default checkpoint is:
+
+```text
+outputs/yolo_training_runs/mannequin_yolo11n_bbox/weights/best.pt
+```
+
+The script fails before Isaac starts if that checkpoint is not present. Use
+`--model PATH` to present a different completed detection checkpoint.
+
 Live YOLO capture requires `ultralytics` in Isaac Sim's own Python environment.
 The standalone Isaac Sim 6.0 package already bundles PyTorch
 `2.11.0+cu128`; it becomes available after `SimulationApp` starts. Install
